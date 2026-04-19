@@ -1,0 +1,13 @@
+[Unit]
+Description=GPU Switcher Boot Intent Applier
+ConditionPathExists=/var/lib/gpu-switcher/config.ini
+After=local-fs.target systemd-modules-load.service libvirtd.service
+Before=display-manager.service graphical.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gpu-switcher-helperd --apply-boot-state
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

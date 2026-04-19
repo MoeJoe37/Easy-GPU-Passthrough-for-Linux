@@ -1,0 +1,13 @@
+[Unit]
+Description=GPU Switcher Helper Daemon
+After=network.target libvirtd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gpu-switcher-helperd
+Restart=on-failure
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
