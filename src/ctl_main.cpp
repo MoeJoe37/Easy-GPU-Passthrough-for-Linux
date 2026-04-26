@@ -77,7 +77,7 @@ int main(int argc, char **argv) {
     QCoreApplication app(argc, argv);
     const auto args = app.arguments();
     if (args.size() < 2) {
-        qCritical() << "Usage: gpu-switcher-ctl <status|probe|inventory|diagnose|simulate|simulateVm|simulateHost|installHook|switchToVm|switchToHost|rebootToVm|rebootToHost|restartHostNow|returnHostNextRestart|keepGpuForVm|applyBootState|on-vm-stopped> [gpuBdf] [--json]";
+        qCritical() << "Usage: gpu-switcher-ctl <status|probe|inventory|diagnose|autoSetupSingleGpu|simulate|simulateVm|simulateHost|installHook|switchToVm|switchToHost|rebootToVm|rebootToHost|restartHostNow|returnHostNextRestart|keepGpuForVm|safetyRecoverHostNow|applyBootState|on-vm-stopped> [gpuBdf] [--json]";
         return 1;
     }
 
@@ -87,7 +87,10 @@ int main(int argc, char **argv) {
     const QString gpuBdf = hasGpuArg ? args.at(2) : QString();
 
     QJsonObject req;
-    if (cmd == "status" || cmd == "installHook" || cmd == "switchToVm" || cmd == "switchToHost" || cmd == "rebootToVm" || cmd == "rebootToHost" || cmd == "restartHostNow" || cmd == "returnHostNextRestart" || cmd == "keepGpuForVm" || cmd == "applyBootState") {
+    if (cmd == "autoSetupSingleGpu") {
+        req = QJsonObject{{"cmd", cmd}};
+        if (!gpuBdf.isEmpty()) req["gpuBdf"] = gpuBdf;
+    } else if (cmd == "status" || cmd == "installHook" || cmd == "switchToVm" || cmd == "switchToHost" || cmd == "rebootToVm" || cmd == "rebootToHost" || cmd == "restartHostNow" || cmd == "returnHostNextRestart" || cmd == "keepGpuForVm" || cmd == "safetyRecoverHostNow" || cmd == "applyBootState") {
         req = QJsonObject{{"cmd", cmd}};
     } else if (cmd == "probe") {
         if (gpuBdf.isEmpty()) {

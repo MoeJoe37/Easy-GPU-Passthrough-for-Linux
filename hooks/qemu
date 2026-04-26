@@ -5,14 +5,19 @@ DOMAIN="${1:-}"
 OP="${2:-}"
 SUBOP="${3:-}"
 
-# libvirt QEMU hook: when the configured Windows VM stops, record a pending
-# user decision instead of automatically rebooting or restoring the GPU.
-# The GUI/CLI then offers three choices:
+# libvirt QEMU hook: when the configured Windows VM fully stops, record a
+# pending user decision instead of blindly rebooting or restoring the GPU.
+# The GUI/CLI then offers:
 #   1. restart now and return the GPU to Linux,
 #   2. return the GPU on the next restart,
-#   3. keep the GPU assigned to the VM/VFIO until changed manually.
-if [[ "$OP" == "stopped" && "$SUBOP" == "end" ]]; then
-  if [[ -x /usr/local/bin/gpu-switcher-ctl ]]; then
-    /usr/local/bin/gpu-switcher-ctl on-vm-stopped "$DOMAIN" || true
-  fi
-fi
+#   3. keep the GPU assigned to VFIO/VM until changed manually.
+case "${OP}:${SUBOP}" in
+  stopped:end|release:end)
+    if [[ -x /usr/local/bin/gpu-switcher-ctl ]]; then
+      /usr/local/bin/gpu-switcher-ctl on-vm-stopped "${DOMAIN}" || true
+    fi
+    ;;
+  *)
+    :
+    ;;
+esac

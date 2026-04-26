@@ -144,6 +144,12 @@ AppConfig loadConfig(QString *error) {
     cfg.hasFallbackDisplay = s.value("hasFallbackDisplay", false).toBool();
     cfg.allowSingleGpu = s.value("allowSingleGpu", false).toBool();
     cfg.autoStartVmOnBoot = s.value("autoStartVmOnBoot", true).toBool();
+    cfg.thermalGuardEnabled = s.value("thermalGuardEnabled", true).toBool();
+    cfg.maxGpuTempC = s.value("maxGpuTempC", 85).toInt();
+    if (cfg.maxGpuTempC < 60 || cfg.maxGpuTempC > 105) cfg.maxGpuTempC = 85;
+    cfg.safetyAutoRecoveryMinutes = s.value("safetyAutoRecoveryMinutes", 10).toInt();
+    if (cfg.safetyAutoRecoveryMinutes < 0 || cfg.safetyAutoRecoveryMinutes > 240) cfg.safetyAutoRecoveryMinutes = 10;
+    cfg.safetyRecoveryDeadline = s.value("safetyRecoveryDeadline").toString();
     cfg.vmStoppedAwaitingDecision = s.value("vmStoppedAwaitingDecision", false).toBool();
     cfg.lastStoppedVm = s.value("lastStoppedVm").toString();
     cfg.lastStoppedAt = s.value("lastStoppedAt").toString();
@@ -177,6 +183,10 @@ bool saveConfig(const AppConfig &cfg, QString *error) {
     s.setValue("hasFallbackDisplay", cfg.hasFallbackDisplay);
     s.setValue("allowSingleGpu", cfg.allowSingleGpu);
     s.setValue("autoStartVmOnBoot", cfg.autoStartVmOnBoot);
+    s.setValue("thermalGuardEnabled", cfg.thermalGuardEnabled);
+    s.setValue("maxGpuTempC", std::clamp(cfg.maxGpuTempC, 60, 105));
+    s.setValue("safetyAutoRecoveryMinutes", std::clamp(cfg.safetyAutoRecoveryMinutes, 0, 240));
+    s.setValue("safetyRecoveryDeadline", cfg.safetyRecoveryDeadline);
     s.setValue("vmStoppedAwaitingDecision", cfg.vmStoppedAwaitingDecision);
     s.setValue("lastStoppedVm", cfg.lastStoppedVm);
     s.setValue("lastStoppedAt", cfg.lastStoppedAt);
@@ -307,6 +317,45 @@ bool iommuGroupIsSafe(const QString &gpuBdf, QStringList *reasons) {
     return safe;
 }
 
+
+bool readGpuTemperatureC(const QString &bdf, int *temperatureC, QString *sensorPath, QString *detail) {
+    const QString normalized = normalizeBdf(bdf);
+    const QString base = sysfsPath(normalized) + "/hwmon";
+    QDir hwmonDir(base);
+    if (!hwmonDir.exists()) {
+        if (detail) *detail = "No hwmon directory for " + normalized;
+        return false;
+    }
+
+    int bestMilliC = -1;
+    QString bestPath;
+    const auto hwmons = hwmonDir.entryList(QStringList{"hwmon*"}, QDir::Dirs | QDir::NoDotAndDotDot);
+    for (const auto &hwmon : hwmons) {
+        QDir d(hwmonDir.absoluteFilePath(hwmon));
+        const auto sensors = d.entryList(QStringList{"temp*_input"}, QDir::Files);
+        for (const auto &sensor : sensors) {
+            bool ok = false;
+            const int milliC = readText(d.absoluteFilePath(sensor)).toInt(&ok);
+            if (!ok || milliC <= 0) continue;
+            if (milliC > bestMilliC) {
+                bestMilliC = milliC;
+                bestPath = d.absoluteFilePath(sensor);
+            }
+        }
+    }
+
+    if (bestMilliC < 0) {
+        if (detail) *detail = "No readable temp*_input sensor under " + base;
+        return false;
+    }
+
+    const int c = bestMilliC / 1000;
+    if (temperatureC) *temperatureC = c;
+    if (sensorPath) *sensorPath = bestPath;
+    if (detail) *detail = QString("GPU temperature %1 C from %2").arg(c).arg(bestPath);
+    return true;
+}
+
 DeviceInfo inspectDevice(const QString &bdf) {
     const QString normalized = normalizeBdf(bdf);
     DeviceInfo d;
@@ -321,6 +370,11 @@ DeviceInfo inspectDevice(const QString &bdf) {
     d.hasResetNode = QFileInfo::exists(base + "/reset");
     d.resetMethod = readText(base + "/reset_method");
     d.iommuGroup = groupNameForDevice(normalized);
+    int tempC = -1;
+    QString tempPath;
+    d.temperatureReadable = readGpuTemperatureC(normalized, &tempC, &tempPath, nullptr);
+    d.temperatureC = tempC;
+    d.temperaturePath = tempPath;
     return d;
 }
 
@@ -414,7 +468,8 @@ static bool parseHostdevs(const QString &xml, QStringList *devices) {
         } else if (xr.isEndElement()) {
             if (xr.name() == "source") inSource = false;
             if (xr.name() == "hostdev") {
-                if (hostdevIsPci && hostdevManaged && !currentBus.isEmpty() && !currentSlot.isEmpty() && !currentFunction.isEmpty()) {
+                Q_UNUSED(hostdevManaged);
+                if (hostdevIsPci && !currentBus.isEmpty() && !currentSlot.isEmpty() && !currentFunction.isEmpty()) {
                     auto hex2 = [](QString v) {
                         v = v.trimmed().toLower();
                         if (v.startsWith("0x")) v.remove(0, 2);
@@ -646,6 +701,9 @@ QVariantMap deviceInfoToMap(const DeviceInfo &d) {
     m["hasResetNode"] = d.hasResetNode;
     m["exists"] = d.exists;
     m["vendor"] = deviceVendorIsAmd(d) ? "AMD" : deviceVendorIsNvidia(d) ? "NVIDIA" : "Other";
+    m["temperatureReadable"] = d.temperatureReadable;
+    m["temperatureC"] = d.temperatureC;
+    m["temperaturePath"] = d.temperaturePath;
     return m;
 }
 
@@ -665,6 +723,13 @@ QVariantMap reportToMap(const CompatibilityReport &r) {
     m["sshdActive"] = r.sshdActive;
     m["nvidiaHiddenState"] = r.nvidiaHiddenState;
     m["gpuHasAudioCompanion"] = r.gpuHasAudioCompanion;
+    m["gpuTemperatureReadable"] = r.gpuTemperatureReadable;
+    m["gpuTemperatureC"] = r.gpuTemperatureC;
+    m["gpuTemperaturePath"] = r.gpuTemperaturePath;
+    m["thermalGuardEnabled"] = r.thermalGuardEnabled;
+    m["maxGpuTempC"] = r.maxGpuTempC;
+    m["safetyAutoRecoveryMinutes"] = r.safetyAutoRecoveryMinutes;
+    m["safetyRecoveryDeadline"] = r.safetyRecoveryDeadline;
     m["gpuModel"] = r.gpuModel;
     m["kernelCmdline"] = r.kernelCmdline;
     m["vendorName"] = r.vendorName;
@@ -690,6 +755,13 @@ CompatibilityReport buildCompatibilityReport(const AppConfig &cfg) {
     const DeviceInfo gpu = inspectDevice(gpuBdf);
     r.vendorName = deviceVendorIsAmd(gpu) ? "AMD" : deviceVendorIsNvidia(gpu) ? "NVIDIA" : (!gpu.vendorId.isEmpty() ? gpu.vendorId : "Unknown");
     r.gpuModel = gpu.deviceId;
+    r.gpuTemperatureReadable = gpu.temperatureReadable;
+    r.gpuTemperatureC = gpu.temperatureC;
+    r.gpuTemperaturePath = gpu.temperaturePath;
+    r.thermalGuardEnabled = cfg.thermalGuardEnabled;
+    r.maxGpuTempC = cfg.maxGpuTempC;
+    r.safetyAutoRecoveryMinutes = cfg.safetyAutoRecoveryMinutes;
+    r.safetyRecoveryDeadline = cfg.safetyRecoveryDeadline;
     r.kernelCmdline = kernelCmdline(&detail);
     r.resetAvailable = gpu.hasResetNode;
     r.vendorResetAvailable = canUseVendorReset(gpu, &detail);
@@ -752,6 +824,10 @@ QVariantMap preflightToMap(const PreflightReport &r) {
         {"hasFallbackDisplay", r.config.hasFallbackDisplay},
         {"allowSingleGpu", r.config.allowSingleGpu},
         {"autoStartVmOnBoot", r.config.autoStartVmOnBoot},
+        {"thermalGuardEnabled", r.config.thermalGuardEnabled},
+        {"maxGpuTempC", r.config.maxGpuTempC},
+        {"safetyAutoRecoveryMinutes", r.config.safetyAutoRecoveryMinutes},
+        {"safetyRecoveryDeadline", r.config.safetyRecoveryDeadline},
         {"vmStoppedAwaitingDecision", r.config.vmStoppedAwaitingDecision},
         {"lastStoppedVm", r.config.lastStoppedVm},
         {"lastStoppedAt", r.config.lastStoppedAt},
@@ -793,7 +869,7 @@ PreflightReport buildPreflightReport(const AppConfig &cfg) {
         else r.notes.push_back(title + ": " + detail);
     };
 
-    r.stages = {"validate-config", "detect-vendor", "check-iommu", "check-group", "check-reset", "check-libvirt", "check-host-recovery"};
+    r.stages = {"validate-config", "detect-vendor", "check-iommu", "check-group", "check-reset", "check-thermal-guard", "check-libvirt", "check-host-recovery"};
 
     if (!isPciBdf(cfg.gpuBdf)) {
         addFinding(DiagnosticSeverity::Blocker, "invalid-gpu-bdf", "GPU PCI address is invalid", cfg.gpuBdf, "Enter a PCI address in the form 0000:01:00.0");
@@ -823,6 +899,25 @@ PreflightReport buildPreflightReport(const AppConfig &cfg) {
     }
     if (!r.compatibility.resetAvailable) {
         addFinding(DiagnosticSeverity::Warning, "no-clean-reset", "GPU does not expose a clean reset node", "The kernel did not expose /reset for this device", "Keep reboot fallback available; AMD systems may benefit from vendor-reset");
+    }
+    if (cfg.thermalGuardEnabled) {
+        if (r.compatibility.gpuTemperatureReadable) {
+            const QString tempDetail = QString("Current GPU temperature is %1 C; configured limit is %2 C").arg(r.compatibility.gpuTemperatureC).arg(cfg.maxGpuTempC);
+            if (r.compatibility.gpuTemperatureC >= cfg.maxGpuTempC) {
+                addFinding(DiagnosticSeverity::Blocker, "gpu-temperature-too-high", "GPU temperature guard blocked VM mode", tempDetail, "Let the GPU cool down, check case airflow/fans, then run preflight again");
+            } else if (r.compatibility.gpuTemperatureC >= cfg.maxGpuTempC - 10) {
+                addFinding(DiagnosticSeverity::Warning, "gpu-temperature-near-limit", "GPU temperature is close to the guard limit", tempDetail, "Improve airflow or raise the limit only if you know your GPU's safe operating range");
+            } else {
+                addFinding(DiagnosticSeverity::Info, "gpu-temperature-ok", "GPU temperature guard passed", tempDetail, "No action needed");
+            }
+        } else {
+            addFinding(DiagnosticSeverity::Warning, "gpu-temperature-unreadable", "GPU temperature sensor is not readable from Linux", "No hwmon temp*_input sensor was found for the configured GPU", "Keep the default post-VM auto recovery enabled and verify fan behavior in the guest OS");
+        }
+    } else {
+        addFinding(DiagnosticSeverity::Warning, "thermal-guard-disabled", "GPU temperature guard is disabled", "The app will not block VM mode based on Linux sensor temperature", "Enable the thermal guard unless you have an external monitoring plan");
+    }
+    if (cfg.safetyAutoRecoveryMinutes == 0) {
+        addFinding(DiagnosticSeverity::Warning, "auto-recovery-disabled", "VM-stop safety recovery timer is disabled", "The GPU may remain bound to VFIO after the VM stops", "Use a positive auto-recovery value unless you intentionally manage recovery manually");
     }
     if (r.vendor == VendorKind::AMD && !r.compatibility.vendorResetAvailable && cfg.useVendorReset) {
         addFinding(DiagnosticSeverity::Warning, "vendor-reset-missing", "AMD vendor-reset is requested but not available", "The vendor-reset module is not loaded or not present", "Install and load vendor-reset if your hardware requires it");
@@ -1006,7 +1101,8 @@ QString renderInventoryText(const QVariantMap &inventory) {
            << m.value("description").toString() << "\n";
         ts << "   driver=" << m.value("driverName").toString()
            << " group=" << m.value("iommuGroup").toString()
-           << " resetNode=" << (m.value("hasResetNode").toBool() ? "yes" : "no") << "\n";
+           << " resetNode=" << (m.value("hasResetNode").toBool() ? "yes" : "no")
+           << " temp=" << (m.value("temperatureReadable").toBool() ? QString::number(m.value("temperatureC").toInt()) + " C" : "unreadable") << "\n";
         const auto companions = m.value("audioCompanions").toList();
         if (!companions.isEmpty()) {
             QStringList c;
@@ -1030,6 +1126,10 @@ QString renderPreflightText(const PreflightReport &r) {
     ts << "IOMMU: " << (r.compatibility.iommuEnabled ? "enabled" : "missing") << "\n";
     ts << "Group safe: " << (r.compatibility.groupSafe ? "yes" : "no") << "\n";
     ts << "Reset node: " << (r.compatibility.resetAvailable ? "yes" : "no") << "\n";
+    ts << "Thermal guard: " << (r.compatibility.thermalGuardEnabled ? "enabled" : "disabled") << "\n";
+    ts << "GPU temperature: " << (r.compatibility.gpuTemperatureReadable ? QString::number(r.compatibility.gpuTemperatureC) + " C" : "unreadable") << "\n";
+    ts << "Temperature limit: " << r.compatibility.maxGpuTempC << " C" << "\n";
+    ts << "VM-stop auto recovery: " << r.compatibility.safetyAutoRecoveryMinutes << " minute(s)" << "\n";
     ts << "Vendor reset: " << (r.compatibility.vendorResetAvailable ? "available" : "not available") << "\n";
     ts << "Libvirt hook: " << (r.compatibility.hookInstalled ? "installed" : "missing") << "\n";
     ts << "Fallback display/SSH: " << (r.compatibility.hasFallbackDisplay || r.compatibility.sshdActive ? "yes" : "no") << "\n";
@@ -1066,6 +1166,10 @@ QString renderPreflightText(const QVariantMap &preflight) {
     ts << "IOMMU: " << (comp.value("iommuEnabled").toBool() ? "enabled" : "missing") << "\n";
     ts << "Group safe: " << (comp.value("groupSafe").toBool() ? "yes" : "no") << "\n";
     ts << "Reset node: " << (comp.value("resetAvailable").toBool() ? "yes" : "no") << "\n";
+    ts << "Thermal guard: " << (comp.value("thermalGuardEnabled").toBool() ? "enabled" : "disabled") << "\n";
+    ts << "GPU temperature: " << (comp.value("gpuTemperatureReadable").toBool() ? QString::number(comp.value("gpuTemperatureC").toInt()) + " C" : "unreadable") << "\n";
+    ts << "Temperature limit: " << comp.value("maxGpuTempC").toInt() << " C" << "\n";
+    ts << "VM-stop auto recovery: " << comp.value("safetyAutoRecoveryMinutes").toInt() << " minute(s)" << "\n";
     ts << "Vendor reset: " << (comp.value("vendorResetAvailable").toBool() ? "available" : "not available") << "\n";
     ts << "Libvirt hook: " << (comp.value("hookInstalled").toBool() ? "installed" : "missing") << "\n";
     ts << "Fallback display/SSH: " << ((comp.value("hasFallbackDisplay").toBool() || comp.value("sshdActive").toBool()) ? "yes" : "no") << "\n";

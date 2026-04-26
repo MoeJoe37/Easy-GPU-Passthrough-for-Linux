@@ -17,6 +17,7 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QStatusBar>
+#include <QSpinBox>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -83,6 +84,15 @@ public:
         fallbackDisplay = new QCheckBox("I have fallback display / SSH access");
         allowSingleGpu = new QCheckBox("I understand single-GPU mode is fragile");
         autoStartVm = new QCheckBox("Auto-start VM after reboot into VM mode");
+        thermalGuard = new QCheckBox("Enable GPU temperature guard");
+        maxGpuTemp = new QSpinBox();
+        maxGpuTemp->setRange(60, 105);
+        maxGpuTemp->setSuffix(" °C");
+        maxGpuTemp->setToolTip("Blocks VM mode when Linux can read the GPU temperature and it is at or above this value.");
+        safetyRecoveryMinutes = new QSpinBox();
+        safetyRecoveryMinutes->setRange(0, 240);
+        safetyRecoveryMinutes->setSuffix(" min");
+        safetyRecoveryMinutes->setToolTip("After the VM stops, automatically reboot to Host after this many minutes unless you choose another action. 0 disables the timer.");
 
         form->addRow("VM name", vmName);
         form->addRow("VM UUID", vmUuid);
@@ -93,6 +103,9 @@ public:
         form->addRow("", fallbackDisplay);
         form->addRow("", allowSingleGpu);
         form->addRow("", autoStartVm);
+        form->addRow("", thermalGuard);
+        form->addRow("Max GPU temperature", maxGpuTemp);
+        form->addRow("VM-stop safety recovery", safetyRecoveryMinutes);
 
         auto *setupBox = new QGroupBox("Setup");
         setupBox->setLayout(form);
@@ -101,6 +114,7 @@ public:
         auto *buttons = new QHBoxLayout();
         probeBtn = new QPushButton("Probe");
         saveBtn = new QPushButton("Save");
+        autoSetupBtn = new QPushButton("Auto setup single GPU");
         hookBtn = new QPushButton("Install hook");
         inventoryBtn = new QPushButton("Inventory");
         diagnoseBtn = new QPushButton("Preflight");
@@ -110,6 +124,7 @@ public:
         refreshBtn = new QPushButton("Refresh status");
         buttons->addWidget(probeBtn);
         buttons->addWidget(saveBtn);
+        buttons->addWidget(autoSetupBtn);
         buttons->addWidget(hookBtn);
         buttons->addWidget(inventoryBtn);
         buttons->addWidget(diagnoseBtn);
@@ -144,6 +159,7 @@ public:
 
         connect(probeBtn, &QPushButton::clicked, this, &MainWindow::onProbe);
         connect(saveBtn, &QPushButton::clicked, this, &MainWindow::onSave);
+        connect(autoSetupBtn, &QPushButton::clicked, this, &MainWindow::onAutoSetupSingleGpu);
         connect(hookBtn, &QPushButton::clicked, this, &MainWindow::onInstallHook);
         connect(inventoryBtn, &QPushButton::clicked, this, &MainWindow::onInventory);
         connect(diagnoseBtn, &QPushButton::clicked, this, &MainWindow::onDiagnose);
@@ -187,7 +203,10 @@ private slots:
             {"useVendorReset", vendorReset->isChecked()},
             {"hasFallbackDisplay", fallbackDisplay->isChecked()},
             {"allowSingleGpu", allowSingleGpu->isChecked()},
-            {"autoStartVmOnBoot", autoStartVm->isChecked()}
+            {"autoStartVmOnBoot", autoStartVm->isChecked()},
+            {"thermalGuardEnabled", thermalGuard->isChecked()},
+            {"maxGpuTempC", maxGpuTemp->value()},
+            {"safetyAutoRecoveryMinutes", safetyRecoveryMinutes->value()}
         };
         auto resp = callHelper(req, &err);
         if (!err.isEmpty()) {
@@ -197,6 +216,34 @@ private slots:
         appendLog("Config saved.");
         appendLog(QString::fromUtf8(QJsonDocument(resp).toJson(QJsonDocument::Indented)));
         refreshStatus(false);
+    }
+
+    void onAutoSetupSingleGpu() {
+        const auto answer = QMessageBox::warning(
+            this,
+            "Auto setup single GPU",
+            "This will save the current VM/GPU fields, enable single-GPU acknowledgement, install the libvirt hook, and add missing GPU/audio PCI hostdev entries to the VM XML after making a backup. Continue?",
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No);
+        if (answer != QMessageBox::Yes) return;
+
+        QString err;
+        QJsonObject req{
+            {"cmd", "autoSetupSingleGpu"},
+            {"vmName", vmName->text().trimmed()},
+            {"vmUuid", vmUuid->text().trimmed()},
+            {"gpuBdf", gpuBdf->text().trimmed()},
+            {"audioBdf", audioBdf->text().trimmed()}
+        };
+        auto resp = callHelper(req, &err);
+        if (!err.isEmpty()) {
+            appendLog("Auto setup failed: " + err);
+            return;
+        }
+        appendLog("Single-GPU auto setup completed.");
+        appendLog(QString::fromUtf8(QJsonDocument(resp).toJson(QJsonDocument::Indented)));
+        refreshFromConfig();
+        refreshStatus(true);
     }
 
     void onInstallHook() {
@@ -304,7 +351,7 @@ private slots:
         const auto answer = QMessageBox::question(
             this,
             "Keep GPU with VM",
-            "This clears the stopped-VM warning and leaves the GPU assigned to VM/VFIO mode until you manually choose Reboot to Host. Continue?",
+            "This clears the stopped-VM warning, cancels the safety recovery timer, and leaves the GPU assigned to VM/VFIO mode until you manually choose Reboot to Host. Continue only if guest/firmware cooling is confirmed.",
             QMessageBox::Yes | QMessageBox::No,
             QMessageBox::No);
         if (answer != QMessageBox::Yes) return;
@@ -354,7 +401,9 @@ private:
         text += " GPUs: " + QString::number(inventory.value("graphicsDevices").toList().size());
         text += " | Mode: " + inventory.value("currentMode").toString();
         text += " | Secure Boot: " + QString(inventory.value("secureBootEnabled").toBool() ? "enabled" : "disabled/unknown");
-        text += " | IOMMU: " + QString(preflight.value("compatibility").toMap().value("iommuEnabled").toBool() ? "enabled" : "missing");
+        const auto comp = preflight.value("compatibility").toMap();
+        text += " | IOMMU: " + QString(comp.value("iommuEnabled").toBool() ? "enabled" : "missing");
+        text += " | GPU temp: " + QString(comp.value("gpuTemperatureReadable").toBool() ? QString::number(comp.value("gpuTemperatureC").toInt()) + " °C" : "unreadable");
         const auto nextBoot = inventory.value("nextBootMode").toString();
         if (!nextBoot.isEmpty()) text += " | Next boot: " + nextBoot;
         if (inventory.value("vmStoppedAwaitingDecision").toBool()) text += " | VM stopped: decision needed";
@@ -368,6 +417,8 @@ private:
         const QString stoppedVm = config.value("lastStoppedVm", inventory.value("lastStoppedVm")).toString();
         const QString stoppedAt = config.value("lastStoppedAt", inventory.value("lastStoppedAt")).toString();
         const QString nextBoot = inventory.value("nextBootMode").toString();
+        const QString safetyDeadline = config.value("safetyRecoveryDeadline").toString();
+        const int safetyMinutes = config.value("safetyAutoRecoveryMinutes").toInt();
         const bool hostRecoveryScheduled = nextBoot == "host" && inventory.value("currentMode").toString() == "vm";
         if (awaiting) setVmStopDecisionButtons(true, true, true);
         else if (hostRecoveryScheduled) setVmStopDecisionButtons(true, false, true);
@@ -377,12 +428,16 @@ private:
             QString text = "The configured VM has stopped, and the GPU is still assigned to VM/VFIO mode.";
             if (!stoppedVm.isEmpty()) text += " VM: " + stoppedVm + ".";
             if (!stoppedAt.isEmpty()) text += " Stopped at UTC: " + stoppedAt + ".";
-            text += " Choose whether to reboot now, restore host ownership on the next restart, or keep the GPU with the VM.";
+            text += " Host recovery is already scheduled for the next restart.";
+            if (safetyMinutes > 0 && !safetyDeadline.isEmpty()) text += " Safety auto-reboot deadline UTC: " + safetyDeadline + ".";
+            text += " Choose whether to reboot now, keep the next-restart recovery, or intentionally keep the GPU with the VM.";
             vmStopStatus->setText(text);
             statusBar()->showMessage("VM stopped; choose GPU recovery action");
         } else {
             if (nextBoot == "host") {
-                vmStopStatus->setText("Host recovery is scheduled for the next restart. The GPU will return to Linux when the machine reboots.");
+                QString text = "Host recovery is scheduled for the next restart. The GPU will return to Linux when the machine reboots.";
+                if (safetyMinutes > 0 && !safetyDeadline.isEmpty()) text += " Safety auto-reboot deadline UTC: " + safetyDeadline + ".";
+                vmStopStatus->setText(text);
             } else {
                 vmStopStatus->setText("No stopped-VM decision is pending.");
             }
@@ -419,6 +474,9 @@ private:
         fallbackDisplay->setChecked(cfg.hasFallbackDisplay);
         allowSingleGpu->setChecked(cfg.allowSingleGpu);
         autoStartVm->setChecked(cfg.autoStartVmOnBoot);
+        thermalGuard->setChecked(cfg.thermalGuardEnabled);
+        maxGpuTemp->setValue(cfg.maxGpuTempC);
+        safetyRecoveryMinutes->setValue(cfg.safetyAutoRecoveryMinutes);
         const int idx = preferredBoot->findText(cfg.preferredBoot);
         if (idx >= 0) preferredBoot->setCurrentIndex(idx);
     }
@@ -438,8 +496,12 @@ private:
     QCheckBox *fallbackDisplay{};
     QCheckBox *allowSingleGpu{};
     QCheckBox *autoStartVm{};
+    QCheckBox *thermalGuard{};
+    QSpinBox *maxGpuTemp{};
+    QSpinBox *safetyRecoveryMinutes{};
     QPushButton *probeBtn{};
     QPushButton *saveBtn{};
+    QPushButton *autoSetupBtn{};
     QPushButton *hookBtn{};
     QPushButton *inventoryBtn{};
     QPushButton *diagnoseBtn{};

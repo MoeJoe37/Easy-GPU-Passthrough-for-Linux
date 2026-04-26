@@ -1,6 +1,7 @@
 [Unit]
 Description=GPU Switcher Helper Daemon
-After=network.target libvirtd.service
+After=network.target libvirtd.service virtqemud.service
+Wants=libvirtd.service virtqemud.service
 
 [Service]
 Type=simple

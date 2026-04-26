@@ -1,7 +1,9 @@
 [Unit]
 Description=GPU Switcher Boot Intent Applier
+Documentation=man:systemd.service(5)
 ConditionPathExists=/var/lib/gpu-switcher/config.ini
-After=local-fs.target systemd-modules-load.service libvirtd.service
+After=local-fs.target systemd-modules-load.service libvirtd.service virtqemud.service
+Wants=libvirtd.service virtqemud.service
 Before=display-manager.service graphical.target
 
 [Service]

@@ -33,6 +33,10 @@ struct AppConfig {
     bool hasFallbackDisplay = false;
     bool allowSingleGpu = false;
     bool autoStartVmOnBoot = true;
+    bool thermalGuardEnabled = true;
+    int maxGpuTempC = 85;
+    int safetyAutoRecoveryMinutes = 10;
+    QString safetyRecoveryDeadline;
     bool vmStoppedAwaitingDecision = false;
     QString lastStoppedVm;
     QString lastStoppedAt;
@@ -51,6 +55,9 @@ struct DeviceInfo {
     QString iommuGroup;
     bool hasResetNode = false;
     bool exists = false;
+    bool temperatureReadable = false;
+    int temperatureC = -1;
+    QString temperaturePath;
 };
 
 struct CompatibilityReport {
@@ -68,6 +75,13 @@ struct CompatibilityReport {
     bool sshdActive = false;
     bool nvidiaHiddenState = false;
     bool gpuHasAudioCompanion = false;
+    bool gpuTemperatureReadable = false;
+    int gpuTemperatureC = -1;
+    int maxGpuTempC = 85;
+    bool thermalGuardEnabled = true;
+    int safetyAutoRecoveryMinutes = 10;
+    QString safetyRecoveryDeadline;
+    QString gpuTemperaturePath;
     QString gpuModel;
     QString kernelCmdline;
     QString vendorName;
@@ -131,6 +145,7 @@ QString kernelCmdline(QString *detail = nullptr);
 bool secureBootEnabled(QString *detail = nullptr);
 bool displayManagerActive(QString *detail = nullptr);
 bool sshdActive(QString *detail = nullptr);
+bool readGpuTemperatureC(const QString &bdf, int *temperatureC = nullptr, QString *sensorPath = nullptr, QString *detail = nullptr);
 QStringList companionAudioFunctions(const QString &gpuBdf, QString *detail = nullptr);
 
 DeviceInfo inspectDevice(const QString &bdf);

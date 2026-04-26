@@ -1,53 +1,67 @@
-# Release Notes
+# Release notes
 
-## v2.2.0
+## 2.4.0
 
-- Added a post-VM-shutdown decision workflow.
-- The libvirt hook now records `vm-stopped-awaiting-decision` instead of automatically scheduling host recovery.
-- Added GUI actions:
-  - **Restart now to Host**
-  - **Return on next restart**
-  - **Keep GPU with VM**
-- Added CLI actions:
-  - `restartHostNow`
-  - `returnHostNextRestart`
-  - `keepGpuForVm`
-- Added persistent config fields for stopped-VM state:
-  - `vmStoppedAwaitingDecision`
-  - `lastStoppedVm`
-  - `lastStoppedAt`
-- Added GUI auto-refresh so stopped-VM state appears without manually pressing refresh.
-- Increased GUI helper response timeout for slower `virsh`/diagnostic calls.
-- Made the helper socket use Qt world-access local socket options so a normal desktop GUI can talk to the root helper.
-- Fixed CLI simulation command routing.
-- Bumped CMake project version to `2.2.0`.
+### Safety hardening
 
-## v2.1.0
+- Added a Linux-side GPU temperature guard using the selected PCI device's `hwmon/temp*_input` sensors when available.
+- Added GUI settings for:
+  - **Enable GPU temperature guard**;
+  - **Max GPU temperature**;
+  - **VM-stop safety recovery** grace period.
+- VM mode is now blocked when the thermal guard can read the GPU temperature and the temperature is at or above the configured limit.
+- Preflight warns when Linux cannot read a GPU temperature sensor, because VFIO/guest ownership can hide host-side thermal telemetry.
+- Preflight warns when the thermal guard or VM-stop safety timer is disabled.
+- When the VM stops, the app now schedules Host recovery for the next restart by default.
+- When the VM stops, the app arms a transient systemd timer that calls `gpu-switcher-ctl safetyRecoverHostNow` after the configured grace period.
+- **Keep GPU with VM** now explicitly cancels the safety recovery timer and warns that this should only be used when guest/firmware cooling is confirmed.
+- Added CLI command `gpu-switcher-ctl safetyRecoverHostNow` for the transient safety timer.
+- Updated `docs/RISKS.md` with thermal/idle-VFIO risks and mitigations.
 
-- Added reboot-handoff workflow for host→VM and VM→host switching.
-- Added `nextBootMode` persistence to the shared config model.
-- Added boot-time application service for early VFIO binding and host recovery.
-- Renamed the main UI actions to reflect reboot-based transitions.
-- Improved inventory and preflight reporting with current mode and next boot target.
+### Notes
 
-## v2.0 development snapshot
+- The app still does not overclock, undervolt, write fan curves, change GPU power limits, or flash firmware.
+- Runtime validation still requires the target Linux host, GPU, libvirt VM, systemd, VFIO/IOMMU, and guest driver stack.
 
-- Added system inventory reporting for graphics, Secure Boot, IOMMU, SSH, and libvirt hook checks.
-- Added richer preflight output shared by the GUI and CLI.
-- Extended vendor classification and reporting with NVIDIA hidden-state, audio-companion, and Secure Boot signals.
-- Introduced an inventory-first workflow for release v2 planning.
-- Added a dry-run simulation command for the host-to-VM transition.
+## 2.3.0
 
-## v1.0.0
+### Added
 
-- State-machine based host/VM transition flow.
-- Vendor-aware GPU detection for AMD and NVIDIA.
-- Pre-flight diagnostics CLI.
-- Libvirt hook installation and verification.
-- Safer recovery paths with reboot fallback when rebind/reset fails.
+- Added **Auto setup single GPU** GUI action.
+- Added `gpu-switcher-ctl autoSetupSingleGpu [gpuBdf]`.
+- Auto-detects the only graphics controller when no GPU BDF is provided.
+- Auto-detects the HDMI/DP audio companion function from the same IOMMU group when possible.
+- Automatically enables the explicit single-GPU acknowledgement during auto setup.
+- Installs the libvirt QEMU hook during auto setup.
+- Backs up inactive libvirt XML before patching.
+- Adds missing GPU/audio PCI `<hostdev>` entries to inactive libvirt XML.
+- Accepts existing libvirt PCI hostdevs regardless of `managed='yes'` or `managed='no'`.
+- Runtime-masks `display-manager.service` for VM-mode boots on true single-GPU systems.
+- Unbinds VT consoles and common platform framebuffers before VFIO binding on single-GPU transitions.
+- Reloads common host GPU modules before attempting host-driver recovery.
+- Hook now handles both `stopped:end` and `release:end` libvirt lifecycle events.
+- VM stopped hook now accepts either configured VM name or UUID.
 
-## Known limitations
+### Changed
 
-- Hardware reset behavior is still GPU- and firmware-dependent.
-- Single-GPU systems remain risky without an alternate recovery path.
-- Full build/runtime verification must be performed on a machine with Qt6, libvirt, and VFIO-capable hardware.
+- Improved systemd ordering so boot handoff runs before the display manager and graphical target.
+- Updated README to explain the automated single-GPU flow.
+- Rewrote the risk register to show what the app now mitigates and what still requires user/hardware action.
+
+### Still requires real-machine validation
+
+- Actual GPU reset/rebind behavior varies by GPU, kernel, driver, firmware, and motherboard.
+- Qt6/libvirt/VFIO runtime testing must be done on the target Linux host.
+
+## 2.2.0
+
+- Added post-VM-close decision flow:
+  - restart now to host;
+  - return on next restart;
+  - keep GPU with VM.
+- Changed the hook to record a pending decision instead of forcing automatic host recovery.
+- Added CLI aliases for the post-VM-close actions.
+
+## 2.1.0 and earlier
+
+- Initial GUI, helper daemon, CLI, preflight report, inventory, boot-state switching, and libvirt hook support.

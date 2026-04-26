@@ -12,6 +12,8 @@
 #include <QTimer>
 #include <QDateTime>
 #include <QDebug>
+#include <QDir>
+#include <QRegularExpression>
 
 using namespace gs;
 
@@ -31,6 +33,7 @@ static void sendJson(QLocalSocket *sock, const QJsonObject &obj) {
     sock->flush();
 }
 
+static bool installHook(QString *error);
 static bool ensureModuleLoaded(const QString &module, QString *detail = nullptr) {
     QProcess p;
     p.start("modprobe", {module});
@@ -47,6 +50,281 @@ static bool ensureModuleLoaded(const QString &module, QString *detail = nullptr)
 }
 
 
+
+static void runBestEffort(const QString &program, const QStringList &args, QStringList *notes, int timeoutMs = 7000) {
+    int exitCode = 0;
+    const QString out = runCommandCapture(program, args, timeoutMs, &exitCode).trimmed();
+    if (notes) {
+        QString msg = program + " " + args.join(' ') + " exit=" + QString::number(exitCode);
+        if (!out.isEmpty()) msg += " | " + out.left(240);
+        notes->push_back(msg);
+    }
+}
+
+
+static void cancelSafetyRecovery(QStringList *notes) {
+    runBestEffort("systemctl", {"stop", "gpu-switcher-safety-recover.timer", "gpu-switcher-safety-recover.service"}, notes, 5000);
+    runBestEffort("systemctl", {"reset-failed", "gpu-switcher-safety-recover.timer", "gpu-switcher-safety-recover.service"}, notes, 5000);
+}
+
+static void scheduleSafetyRecoveryTimer(const AppConfig &cfg, QStringList *notes) {
+    if (cfg.safetyAutoRecoveryMinutes <= 0) {
+        if (notes) notes->push_back("Safety auto recovery is disabled by config");
+        return;
+    }
+
+    cancelSafetyRecovery(notes);
+
+    const QString delay = QString::number(cfg.safetyAutoRecoveryMinutes) + "min";
+    runBestEffort("systemd-run",
+                  {"--unit=gpu-switcher-safety-recover",
+                   "--collect",
+                   "--on-active=" + delay,
+                   "/usr/local/bin/gpu-switcher-ctl",
+                   "safetyRecoverHostNow"},
+                  notes,
+                  10000);
+    if (notes) notes->push_back("Safety recovery timer armed for " + delay + " after VM stop");
+}
+
+static void stopDisplayManager(QStringList *notes) {
+    runBestEffort("systemctl", {"stop", "display-manager.service"}, notes, 10000);
+}
+
+static void unmaskDisplayManager(QStringList *notes) {
+    runBestEffort("systemctl", {"unmask", "display-manager.service"}, notes, 10000);
+}
+
+static void maskDisplayManagerForThisBoot(QStringList *notes) {
+    // Runtime mask disappears on reboot; it prevents the Linux login manager
+    // from racing the VM for the only GPU during VM-mode boots.
+    runBestEffort("systemctl", {"mask", "--runtime", "display-manager.service"}, notes, 10000);
+}
+
+static void bindVtConsoles(bool bind, QStringList *notes) {
+    QDir dir("/sys/class/vtconsole");
+    const auto entries = dir.entryList(QStringList{"vtcon*"}, QDir::Dirs | QDir::NoDotAndDotDot);
+    for (const auto &entry : entries) {
+        QFile f(dir.absoluteFilePath(entry + "/bind"));
+        if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            f.write(bind ? "1" : "0");
+            if (notes) notes->push_back(QString("%1 VT console %2").arg(bind ? "Rebound" : "Unbound", entry));
+        }
+    }
+}
+
+static void unbindPlatformFramebuffers(QStringList *notes) {
+    const QStringList drivers = {"efi-framebuffer", "simple-framebuffer", "vesafb", "simpledrm"};
+    for (const auto &driver : drivers) {
+        QDir d("/sys/bus/platform/drivers/" + driver);
+        if (!d.exists()) continue;
+        const auto devices = d.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+        for (const auto &dev : devices) {
+            QFile unbind(d.absoluteFilePath("unbind"));
+            if (unbind.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                unbind.write(dev.toUtf8());
+                if (notes) notes->push_back("Unbound platform framebuffer " + driver + ":" + dev);
+            }
+        }
+    }
+}
+
+static void unloadGpuModulesFor(VendorKind kind, QStringList *notes) {
+    if (kind == VendorKind::NVIDIA) {
+        runBestEffort("modprobe", {"-r", "nvidia_drm", "nvidia_modeset", "nvidia_uvm", "nvidia", "i2c_nvidia_gpu"}, notes, 10000);
+    } else if (kind == VendorKind::AMD) {
+        runBestEffort("modprobe", {"-r", "amdgpu", "radeon"}, notes, 10000);
+    } else if (kind == VendorKind::Intel) {
+        runBestEffort("modprobe", {"-r", "i915", "xe"}, notes, 10000);
+    }
+}
+
+static void loadGpuModulesForDriver(const QString &driver, QStringList *notes) {
+    const QString d = driver.trimmed();
+    if (d.isEmpty() || d == "vfio-pci") return;
+    if (d == "nvidia" || d.startsWith("nvidia_")) {
+        runBestEffort("modprobe", {"nvidia"}, notes, 10000);
+        runBestEffort("modprobe", {"nvidia_modeset"}, notes, 10000);
+        runBestEffort("modprobe", {"nvidia_uvm"}, notes, 10000);
+        runBestEffort("modprobe", {"nvidia_drm"}, notes, 10000);
+    } else {
+        runBestEffort("modprobe", {d}, notes, 10000);
+    }
+}
+
+static void prepareSingleGpuHostForVfio(bool singleGraphicsPath, VendorKind kind, QStringList *notes) {
+    if (!singleGraphicsPath) return;
+    if (notes) notes->push_back("Single-GPU transition: preventing display-manager/framebuffer from racing VFIO");
+    maskDisplayManagerForThisBoot(notes);
+    stopDisplayManager(notes);
+    bindVtConsoles(false, notes);
+    unbindPlatformFramebuffers(notes);
+    unloadGpuModulesFor(kind, notes);
+}
+
+static void restoreHostConsoleAfterRecovery(QStringList *notes) {
+    bindVtConsoles(true, notes);
+    unmaskDisplayManager(notes);
+}
+
+static QString hostdevXmlForBdf(const QString &bdf) {
+    const QString n = normalizeBdf(bdf);
+    const QString domain = n.section(':', 0, 0);
+    const QString bus = n.section(':', 1, 1);
+    const QString devFunc = n.section(':', 2, 2);
+    const QString slot = devFunc.section('.', 0, 0);
+    const QString function = devFunc.section('.', 1, 1);
+    return QString(
+        "    <hostdev mode='subsystem' type='pci' managed='yes'>\n"
+        "      <driver name='vfio'/>\n"
+        "      <source>\n"
+        "        <address domain='0x%1' bus='0x%2' slot='0x%3' function='0x%4'/>\n"
+        "      </source>\n"
+        "    </hostdev>\n")
+        .arg(domain, bus, slot, function);
+}
+
+static bool xmlContainsBdfHostdev(const QString &xml, const QString &bdf) {
+    const QString n = normalizeBdf(bdf);
+    if (n.isEmpty()) return false;
+    const QString domain = n.section(':', 0, 0);
+    const QString bus = n.section(':', 1, 1);
+    const QString devFunc = n.section(':', 2, 2);
+    const QString slot = devFunc.section('.', 0, 0);
+    const QString function = devFunc.section('.', 1, 1);
+    QRegularExpression re(QString("<address[^>]+domain=['\\\"]0x%1['\\\"][^>]+bus=['\\\"]0x%2['\\\"][^>]+slot=['\\\"]0x%3['\\\"][^>]+function=['\\\"]0x%4['\\\"]")
+                          .arg(domain, bus, slot, function), QRegularExpression::CaseInsensitiveOption);
+    return re.match(xml).hasMatch();
+}
+
+static bool backupRawDomainXml(const QString &domain, const QString &xml, QString *backupPath, QString *error) {
+    if (!ensureRuntimeDirs(error)) return false;
+    QString safeDomain = domain;
+    safeDomain.replace('/', '_');
+    const QString stamp = QDateTime::currentDateTimeUtc().toString("yyyyMMdd-HHmmss");
+    const QString path = backupDirPath() + "/" + safeDomain + "-before-autopatch-" + stamp + ".xml";
+    if (!writeFile(path, xml, error)) return false;
+    if (backupPath) *backupPath = path;
+    return true;
+}
+
+static bool ensureDomainHasHostdevs(const AppConfig &cfg, QStringList *notes, QString *error) {
+    const QString domain = domainIdForConfig(cfg);
+    if (domain.isEmpty()) {
+        if (error) *error = "VM name/UUID is not configured";
+        return false;
+    }
+
+    int exitCode = 0;
+    QString xml = runCommandCapture("virsh", {"-c", "qemu:///system", "dumpxml", "--inactive", domain}, 10000, &exitCode);
+    if (exitCode != 0 || xml.trimmed().isEmpty()) {
+        if (error) *error = "Unable to read inactive XML for " + domain;
+        return false;
+    }
+
+    QString backup;
+    if (!backupRawDomainXml(domain, xml, &backup, error)) return false;
+    if (notes) notes->push_back("Backed up inactive VM XML to " + backup);
+
+    QString insertion;
+    const QStringList wanted = cfg.audioBdf.trimmed().isEmpty()
+        ? QStringList{normalizeBdf(cfg.gpuBdf)}
+        : QStringList{normalizeBdf(cfg.gpuBdf), normalizeBdf(cfg.audioBdf)};
+    for (const auto &bdf : wanted) {
+        if (bdf.isEmpty()) continue;
+        if (!xmlContainsBdfHostdev(xml, bdf)) {
+            insertion += hostdevXmlForBdf(bdf);
+            if (notes) notes->push_back("Adding PCI hostdev to VM XML: " + bdf);
+        } else if (notes) {
+            notes->push_back("VM XML already contains PCI hostdev: " + bdf);
+        }
+    }
+
+    if (insertion.isEmpty()) return true;
+    const int pos = xml.indexOf("</devices>");
+    if (pos < 0) {
+        if (error) *error = "Inactive VM XML has no </devices> section";
+        return false;
+    }
+    xml.insert(pos, insertion);
+
+    const QString patchedPath = backupDirPath() + "/" + domain + "-autopatched.xml";
+    if (!writeFile(patchedPath, xml, error)) return false;
+    const QString defineOut = runCommandCapture("virsh", {"-c", "qemu:///system", "define", patchedPath}, 15000, &exitCode);
+    if (exitCode != 0) {
+        if (error) *error = "virsh define failed after XML autopatch: " + defineOut.trimmed();
+        return false;
+    }
+    if (notes) notes->push_back("Defined autopatched VM XML with GPU/audio hostdevs");
+    return true;
+}
+
+static bool autoConfigureSingleGpu(AppConfig cfg, const QJsonObject &req, QJsonObject *payload, QString *error) {
+    QStringList notes;
+
+    const QString reqVmName = req.value("vmName").toString().trimmed();
+    const QString reqVmUuid = req.value("vmUuid").toString().trimmed();
+    if (!reqVmName.isEmpty()) cfg.vmName = reqVmName;
+    if (!reqVmUuid.isEmpty()) cfg.vmUuid = reqVmUuid;
+
+    QString selectedGpu = normalizeBdf(req.value("gpuBdf").toString());
+    if (selectedGpu.isEmpty()) selectedGpu = normalizeBdf(cfg.gpuBdf);
+    if (selectedGpu.isEmpty()) {
+        const QStringList gfx = allGraphicsControllers(nullptr);
+        if (gfx.size() == 1) selectedGpu = normalizeBdf(gfx.first());
+        else {
+            if (error) *error = "Auto setup found " + QString::number(gfx.size()) + " graphics devices; select the GPU PCI BDF manually first";
+            return false;
+        }
+    }
+
+    cfg.gpuBdf = selectedGpu;
+    QString selectedAudio = normalizeBdf(req.value("audioBdf").toString());
+    if (selectedAudio.isEmpty()) selectedAudio = normalizeBdf(cfg.audioBdf);
+    if (selectedAudio.isEmpty()) {
+        const auto companions = companionAudioFunctions(selectedGpu, nullptr);
+        if (!companions.isEmpty()) selectedAudio = companions.first();
+    }
+    cfg.audioBdf = selectedAudio;
+
+    if (domainIdForConfig(cfg).isEmpty()) {
+        if (error) *error = "Set the VM name or UUID before running auto setup";
+        return false;
+    }
+
+    QString detail;
+    cfg.allowSingleGpu = true;
+    cfg.hasFallbackDisplay = cfg.hasFallbackDisplay || systemHasFallbackDisplay(&detail) || sshdActive(&detail);
+    cfg.autoStartVmOnBoot = true;
+    cfg.mode = cfg.mode.isEmpty() ? "host" : cfg.mode;
+
+    if (!saveConfig(cfg, error)) return false;
+    notes << "Saved single-GPU config: GPU=" + cfg.gpuBdf + (cfg.audioBdf.isEmpty() ? QString() : " audio=" + cfg.audioBdf);
+
+    if (!installHook(error)) return false;
+    notes << "Installed libvirt QEMU lifecycle hook";
+
+    if (!ensureDomainHasHostdevs(cfg, &notes, error)) return false;
+
+    QStringList xmlIssues;
+    if (!vmXmlMatchesConfig(cfg, &xmlIssues, nullptr)) {
+        if (error) *error = "VM XML still does not match after autopatch: " + xmlIssues.join("; ");
+        return false;
+    }
+
+    const auto diag = buildPreflightReport(cfg);
+    if (payload) {
+        (*payload)["configured"] = true;
+        (*payload)["config"] = QJsonObject{
+            {"vmName", cfg.vmName}, {"vmUuid", cfg.vmUuid}, {"gpuBdf", cfg.gpuBdf}, {"audioBdf", cfg.audioBdf},
+            {"allowSingleGpu", cfg.allowSingleGpu}, {"hasFallbackDisplay", cfg.hasFallbackDisplay}, {"autoStartVmOnBoot", cfg.autoStartVmOnBoot}
+        };
+        (*payload)["notes"] = QJsonArray::fromStringList(notes);
+        (*payload)["diagnostic"] = QJsonObject::fromVariantMap(preflightToMap(diag));
+        (*payload)["inventory"] = QJsonObject::fromVariantMap(systemInventoryToMap());
+    }
+    return true;
+}
 static bool startVmDomain(const AppConfig &cfg, QStringList *notes, QString *error) {
     const QString domain = domainIdForConfig(cfg);
     if (domain.isEmpty()) {
@@ -77,7 +355,9 @@ static bool scheduleBootTransition(AppConfig cfg, const QString &target, QString
     }
 
     cfg.nextBootMode = normalized;
+    cfg.safetyRecoveryDeadline.clear();
     cfg.vmStoppedAwaitingDecision = false;
+    cancelSafetyRecovery(notes);
     QString saveError;
     if (!saveConfig(cfg, &saveError) || !writeState("pending-" + normalized, &saveError)) {
         if (error) *error = saveError;
@@ -88,16 +368,26 @@ static bool scheduleBootTransition(AppConfig cfg, const QString &target, QString
 }
 
 static bool markVmStoppedAwaitingDecision(AppConfig cfg, const QString &domain, QStringList *notes, QString *error) {
-    if (!cfg.vmName.trimmed().isEmpty() && !domain.trimmed().isEmpty() && domain.trimmed() != cfg.vmName.trimmed()) {
-        if (notes) notes->push_back("Ignoring stopped VM " + domain + "; configured VM is " + cfg.vmName.trimmed());
+    const QString d = domain.trimmed();
+    const QString configuredName = cfg.vmName.trimmed();
+    const QString configuredUuid = cfg.vmUuid.trimmed();
+    const bool hasFilter = !configuredName.isEmpty() || !configuredUuid.isEmpty();
+    const bool matches = d.isEmpty() || d == configuredName || d == configuredUuid;
+    if (hasFilter && !matches) {
+        if (notes) notes->push_back("Ignoring stopped VM " + domain + "; configured VM is " + domainIdForConfig(cfg));
         return true;
     }
 
     cfg.vmStoppedAwaitingDecision = true;
     cfg.lastStoppedVm = domain.trimmed().isEmpty() ? domainIdForConfig(cfg) : domain.trimmed();
     cfg.lastStoppedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
-    cfg.nextBootMode.clear();
+    cfg.nextBootMode = "host";
     cfg.mode = "vm";
+    if (cfg.safetyAutoRecoveryMinutes > 0) {
+        cfg.safetyRecoveryDeadline = QDateTime::currentDateTimeUtc().addSecs(cfg.safetyAutoRecoveryMinutes * 60).toString(Qt::ISODate);
+    } else {
+        cfg.safetyRecoveryDeadline.clear();
+    }
 
     QString saveError;
     if (!saveConfig(cfg, &saveError) || !writeState("vm-stopped-awaiting-decision", &saveError)) {
@@ -106,15 +396,19 @@ static bool markVmStoppedAwaitingDecision(AppConfig cfg, const QString &domain, 
     }
     if (notes) {
         notes->push_back("VM stopped; waiting for user recovery decision");
+        notes->push_back("Default fail-safe: host recovery is scheduled for the next restart");
         notes->push_back("Options: reboot to host now, restore host on next restart, or keep GPU assigned to VM");
     }
+    scheduleSafetyRecoveryTimer(cfg, notes);
     return true;
 }
 
 static bool keepGpuAssignedToVm(AppConfig cfg, QStringList *notes, QString *error) {
     cfg.vmStoppedAwaitingDecision = false;
     cfg.nextBootMode.clear();
+    cfg.safetyRecoveryDeadline.clear();
     cfg.mode = "vm";
+    cancelSafetyRecovery(notes);
     QString saveError;
     if (!saveConfig(cfg, &saveError) || !writeState("vm", &saveError)) {
         if (error) *error = saveError;
@@ -168,8 +462,11 @@ DOMAIN="${1:-}"
 OP="${2:-}"
 SUBOP="${3:-}"
 
+# Called by libvirt when the configured VM finishes.  We only record
+# a pending decision; the user chooses host-now, host-next-restart,
+# or keep-vfio from the GUI/CLI.
 case "${OP}:${SUBOP}" in
-  stopped:end)
+  stopped:end|release:end)
     if [[ -x /usr/local/bin/gpu-switcher-ctl ]]; then
       /usr/local/bin/gpu-switcher-ctl on-vm-stopped "${DOMAIN}" || true
     fi
@@ -221,6 +518,7 @@ static bool recoverDeviceToDriver(const QString &bdf, const QString &driver, QSt
 
     (void)clearDriverOverride(normalized, nullptr);
     (void)unbindDriver(normalized, nullptr);
+    loadGpuModulesForDriver(driver, notes);
     if (bindToDriver(normalized, driver, nullptr)) {
         if (notes) notes->push_back("Rebound " + normalized + " to " + driver);
         return true;
@@ -252,6 +550,22 @@ public:
         while (state_ != VmState::Done && state_ != VmState::Failed) {
             if (!stepVm(error)) {
                 state_ = VmState::Failed;
+                notes_ << "VM handoff failed; attempting best-effort rollback to host ownership";
+                QString rollbackError;
+                if (!cfg_.audioBdf.isEmpty() && !cfg_.originalAudioDriver.isEmpty()) {
+                    (void)recoverDeviceToDriver(cfg_.audioBdf, cfg_.originalAudioDriver, &notes_, &rollbackError);
+                }
+                if (!cfg_.gpuBdf.isEmpty() && !cfg_.originalGpuDriver.isEmpty()) {
+                    (void)recoverDeviceToDriver(cfg_.gpuBdf, cfg_.originalGpuDriver, &notes_, &rollbackError);
+                }
+                restoreHostConsoleAfterRecovery(&notes_);
+                cfg_.mode = "host";
+                cfg_.nextBootMode.clear();
+                QString saveError;
+                (void)saveConfig(cfg_, &saveError);
+                (void)writeState("host-rollback", &saveError);
+                if (!rollbackError.isEmpty()) notes_ << "Rollback note: " + rollbackError;
+                if (!saveError.isEmpty()) notes_ << "Rollback state note: " + saveError;
                 break;
             }
         }
@@ -362,6 +676,7 @@ private:
             }
             const VendorKind kind = vendorKind(gpu);
             notes_ << "Detected vendor: " + vendorKindName(kind);
+            prepareSingleGpuHostForVfio(preflight_.compatibility.singleGraphicsPath, kind, &notes_);
             if (kind == VendorKind::AMD && cfg_.useVendorReset) {
                 QString moduleDetail;
                 if (ensureModuleLoaded("vendor-reset", &moduleDetail)) {
@@ -468,6 +783,7 @@ private:
                 return false;
             }
             notes_ << "State persisted as host";
+            restoreHostConsoleAfterRecovery(&notes_);
             hostState_ = HostState::Done;
             return true;
         }
@@ -651,6 +967,10 @@ private:
                     {"hasFallbackDisplay", cfg.hasFallbackDisplay},
                     {"allowSingleGpu", cfg.allowSingleGpu},
                     {"autoStartVmOnBoot", cfg.autoStartVmOnBoot},
+                    {"thermalGuardEnabled", cfg.thermalGuardEnabled},
+                    {"maxGpuTempC", cfg.maxGpuTempC},
+                    {"safetyAutoRecoveryMinutes", cfg.safetyAutoRecoveryMinutes},
+                    {"safetyRecoveryDeadline", cfg.safetyRecoveryDeadline},
                     {"vmStoppedAwaitingDecision", cfg.vmStoppedAwaitingDecision},
                     {"lastStoppedVm", cfg.lastStoppedVm},
                     {"lastStoppedAt", cfg.lastStoppedAt},
@@ -685,6 +1005,18 @@ private:
                 continue;
             }
 
+            if (cmd == "autoSetupSingleGpu") {
+                QString err;
+                QJsonObject payload;
+                AppConfig cfg = loadConfig();
+                if (!autoConfigureSingleGpu(cfg, req, &payload, &err)) {
+                    sendJson(sock, errorReply(err));
+                    continue;
+                }
+                sendJson(sock, okReply(payload));
+                continue;
+            }
+
             if (cmd == "saveConfig") {
                 AppConfig cfg = loadConfig();
                 cfg.vmName = req.value("vmName").toString().trimmed();
@@ -697,6 +1029,10 @@ private:
                 cfg.hasFallbackDisplay = req.value("hasFallbackDisplay").toBool(cfg.hasFallbackDisplay);
                 cfg.allowSingleGpu = req.value("allowSingleGpu").toBool(cfg.allowSingleGpu);
                 cfg.autoStartVmOnBoot = req.value("autoStartVmOnBoot").toBool(cfg.autoStartVmOnBoot);
+                cfg.thermalGuardEnabled = req.value("thermalGuardEnabled").toBool(cfg.thermalGuardEnabled);
+                cfg.maxGpuTempC = req.value("maxGpuTempC").toInt(cfg.maxGpuTempC);
+                cfg.safetyAutoRecoveryMinutes = req.value("safetyAutoRecoveryMinutes").toInt(cfg.safetyAutoRecoveryMinutes);
+                cfg.safetyRecoveryDeadline = req.value("safetyRecoveryDeadline").toString(cfg.safetyRecoveryDeadline);
                 cfg.vmStoppedAwaitingDecision = req.value("vmStoppedAwaitingDecision").toBool(cfg.vmStoppedAwaitingDecision);
                 cfg.lastStoppedVm = req.value("lastStoppedVm").toString(cfg.lastStoppedVm);
                 cfg.lastStoppedAt = req.value("lastStoppedAt").toString(cfg.lastStoppedAt);
@@ -795,6 +1131,30 @@ private:
                     continue;
                 }
                 sendJson(sock, okReply({{"mode", "vm"}, {"action", "keep-vm"}, {"notes", QJsonArray::fromStringList(notes)}}));
+                continue;
+            }
+
+            if (cmd == "safetyRecoverHostNow") {
+                QString err;
+                QStringList notes;
+                AppConfig cfg = loadConfig();
+                if (!cfg.vmStoppedAwaitingDecision) {
+                    notes << "Safety recovery timer fired, but no stopped-VM decision is pending; no reboot will be triggered";
+                    sendJson(sock, okReply({{"mode", cfg.mode}, {"action", "noop"}, {"notes", QJsonArray::fromStringList(notes)}}));
+                    continue;
+                }
+                if (cfg.safetyAutoRecoveryMinutes <= 0) {
+                    notes << "Safety recovery timer fired, but auto recovery is disabled; no reboot will be triggered";
+                    sendJson(sock, okReply({{"mode", cfg.mode}, {"action", "noop"}, {"notes", QJsonArray::fromStringList(notes)}}));
+                    continue;
+                }
+                if (!scheduleBootTransition(cfg, "host", &notes, &err)) {
+                    sendJson(sock, errorReply(err));
+                    continue;
+                }
+                notes << "Safety recovery timeout reached; rebooting to restore the Linux host GPU driver";
+                sendJson(sock, okReply({{"mode", "pending-host"}, {"action", "safety-reboot-now"}, {"notes", QJsonArray::fromStringList(notes)}}));
+                QTimer::singleShot(1500, []() { QProcess::startDetached("systemctl", {"reboot"}); });
                 continue;
             }
 
