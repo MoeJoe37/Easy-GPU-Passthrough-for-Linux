@@ -1,4 +1,3 @@
-
 #include "common.h"
 
 #include <QApplication>
@@ -7,15 +6,18 @@
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QLocalSocket>
 #include <QMainWindow>
+#include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QStatusBar>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -24,26 +26,29 @@ using namespace gs;
 static QJsonObject callHelper(const QJsonObject &req, QString *err = nullptr) {
     QLocalSocket sock;
     sock.connectToServer(socketPath());
-    if (!sock.waitForConnected(3000)) {
+    if (!sock.waitForConnected(5000)) {
         if (err) *err = "Could not connect to helper at " + socketPath();
         return {};
     }
+
     const QByteArray line = QJsonDocument(req).toJson(QJsonDocument::Compact) + '\n';
     sock.write(line);
-    if (!sock.waitForBytesWritten(3000)) {
+    if (!sock.waitForBytesWritten(5000)) {
         if (err) *err = "Failed to send request";
         return {};
     }
-    if (!sock.waitForReadyRead(3000)) {
+    if (!sock.waitForReadyRead(30000)) {
         if (err) *err = "No response from helper";
         return {};
     }
+
     const QByteArray resp = sock.readLine().trimmed();
     const auto doc = QJsonDocument::fromJson(resp);
     if (!doc.isObject()) {
         if (err) *err = "Invalid helper response";
         return {};
     }
+
     const QJsonObject obj = doc.object();
     if (!obj.value("ok").toBool()) {
         if (err) *err = obj.value("error").toString("Helper error");
@@ -56,12 +61,12 @@ class MainWindow : public QMainWindow {
 public:
     MainWindow() {
         setWindowTitle("GPU Switcher");
-        resize(1120, 860);
+        resize(1180, 900);
 
         auto *central = new QWidget(this);
         auto *root = new QVBoxLayout(central);
 
-        auto *title = new QLabel("<h2>GPU Switcher</h2><p>VFIO helper for safe GPU host↔VM transitions.</p>");
+        auto *title = new QLabel("<h2>GPU Switcher</h2><p>VFIO helper for controlled Linux host ↔ Windows VM GPU ownership.</p>");
         summary = new QLabel("Loading status...");
         summary->setWordWrap(true);
         root->addWidget(title);
@@ -114,6 +119,21 @@ public:
         buttons->addWidget(refreshBtn);
         root->addLayout(buttons);
 
+        auto *decisionLayout = new QHBoxLayout();
+        vmStopStatus = new QLabel("No stopped-VM decision is pending.");
+        vmStopStatus->setWordWrap(true);
+        restartHostNowBtn = new QPushButton("Restart now to Host");
+        hostNextRestartBtn = new QPushButton("Return on next restart");
+        keepVmBtn = new QPushButton("Keep GPU with VM");
+        decisionLayout->addWidget(vmStopStatus, 1);
+        decisionLayout->addWidget(restartHostNowBtn);
+        decisionLayout->addWidget(hostNextRestartBtn);
+        decisionLayout->addWidget(keepVmBtn);
+
+        auto *decisionBox = new QGroupBox("After the Windows VM closes");
+        decisionBox->setLayout(decisionLayout);
+        root->addWidget(decisionBox);
+
         log = new QPlainTextEdit();
         log->setReadOnly(true);
         log->setPlaceholderText("Logs and compatibility checks appear here.");
@@ -130,10 +150,18 @@ public:
         connect(simulateBtn, &QPushButton::clicked, this, &MainWindow::onSimulateVm);
         connect(vmBtn, &QPushButton::clicked, this, &MainWindow::onSwitchToVm);
         connect(hostBtn, &QPushButton::clicked, this, &MainWindow::onSwitchToHost);
-        connect(refreshBtn, &QPushButton::clicked, this, &MainWindow::refreshStatus);
+        connect(refreshBtn, &QPushButton::clicked, this, [this]() { refreshStatus(true); });
+        connect(restartHostNowBtn, &QPushButton::clicked, this, &MainWindow::onRestartHostNow);
+        connect(hostNextRestartBtn, &QPushButton::clicked, this, &MainWindow::onReturnHostNextRestart);
+        connect(keepVmBtn, &QPushButton::clicked, this, &MainWindow::onKeepGpuForVm);
 
+        autoRefresh = new QTimer(this);
+        connect(autoRefresh, &QTimer::timeout, this, [this]() { refreshStatus(false); });
+        autoRefresh->start(10000);
+
+        setVmStopDecisionEnabled(false);
         refreshFromConfig();
-        refreshStatus();
+        refreshStatus(true);
     }
 
 private slots:
@@ -168,7 +196,7 @@ private slots:
         }
         appendLog("Config saved.");
         appendLog(QString::fromUtf8(QJsonDocument(resp).toJson(QJsonDocument::Indented)));
-        refreshStatus();
+        refreshStatus(false);
     }
 
     void onInstallHook() {
@@ -180,7 +208,7 @@ private slots:
         }
         appendLog("Hook installed at " + hookPath());
         appendLog(QString::fromUtf8(QJsonDocument(resp).toJson(QJsonDocument::Indented)));
-        refreshStatus();
+        refreshStatus(false);
     }
 
     void onInventory() {
@@ -205,7 +233,6 @@ private slots:
         appendLog(renderPreflightText(resp.value("diagnostic").toObject().toVariantMap()));
     }
 
-
     void onSimulateVm() {
         QString err;
         QJsonObject req{{"cmd", "simulateVm"}};
@@ -223,6 +250,7 @@ private slots:
     }
 
     void onSwitchToVm() {
+        if (!confirmReboot("Reboot to VM mode", "The PC will restart and the GPU will be bound to vfio-pci for the VM. Continue?")) return;
         QString err;
         auto resp = callHelper({{"cmd", "switchToVm"}}, &err);
         if (!err.isEmpty()) {
@@ -235,6 +263,7 @@ private slots:
     }
 
     void onSwitchToHost() {
+        if (!confirmReboot("Reboot to Host mode", "The PC will restart and try to return the GPU to the Linux host driver. Continue?")) return;
         QString err;
         auto resp = callHelper({{"cmd", "switchToHost"}}, &err);
         if (!err.isEmpty()) {
@@ -246,22 +275,77 @@ private slots:
         statusBar()->showMessage("System will reboot back into host mode");
     }
 
-    void refreshStatus() {
+    void onRestartHostNow() {
+        if (!confirmReboot("Restart now to Host", "The PC will restart now and restore the GPU to the Linux host. Continue?")) return;
         QString err;
-        auto resp = callHelper({{"cmd", "status"}}, &err);
+        auto resp = callHelper({{"cmd", "restartHostNow"}}, &err);
         if (!err.isEmpty()) {
-            appendLog("Status unavailable: " + err);
+            appendLog("Could not schedule immediate host recovery: " + err);
             return;
         }
-        const auto inventory = resp.value("inventory").toObject().toVariantMap();
-        const auto preflight = resp.value("preflight").toObject().toVariantMap();
-        summary->setText(renderSummary(inventory, preflight));
-        appendLog("Status:\n" + QString::fromUtf8(QJsonDocument(resp).toJson(QJsonDocument::Indented)));
-        appendLog(renderInventoryText(inventory));
-        appendLog(renderPreflightText(preflight));
+        appendLog("Immediate host recovery scheduled.");
+        appendLog(QString::fromUtf8(QJsonDocument(resp).toJson(QJsonDocument::Indented)));
+        statusBar()->showMessage("System will reboot to Host mode");
+    }
+
+    void onReturnHostNextRestart() {
+        QString err;
+        auto resp = callHelper({{"cmd", "returnHostNextRestart"}}, &err);
+        if (!err.isEmpty()) {
+            appendLog("Could not schedule next-restart host recovery: " + err);
+            return;
+        }
+        appendLog("Host recovery will happen on the next restart. No reboot was started now.");
+        appendLog(QString::fromUtf8(QJsonDocument(resp).toJson(QJsonDocument::Indented)));
+        refreshStatus(false);
+    }
+
+    void onKeepGpuForVm() {
+        const auto answer = QMessageBox::question(
+            this,
+            "Keep GPU with VM",
+            "This clears the stopped-VM warning and leaves the GPU assigned to VM/VFIO mode until you manually choose Reboot to Host. Continue?",
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No);
+        if (answer != QMessageBox::Yes) return;
+
+        QString err;
+        auto resp = callHelper({{"cmd", "keepGpuForVm"}}, &err);
+        if (!err.isEmpty()) {
+            appendLog("Could not keep GPU assigned to VM: " + err);
+            return;
+        }
+        appendLog("GPU will stay assigned to the VM until manually changed.");
+        appendLog(QString::fromUtf8(QJsonDocument(resp).toJson(QJsonDocument::Indented)));
+        refreshStatus(false);
     }
 
 private:
+    void refreshStatus(bool verbose = false) {
+        QString err;
+        auto resp = callHelper({{"cmd", "status"}}, &err);
+        if (!err.isEmpty()) {
+            if (err != lastStatusError || verbose) appendLog("Status unavailable: " + err);
+            lastStatusError = err;
+            summary->setText("Status unavailable: " + err);
+            setVmStopDecisionEnabled(false);
+            return;
+        }
+        lastStatusError.clear();
+
+        const auto inventory = resp.value("inventory").toObject().toVariantMap();
+        const auto preflight = resp.value("preflight").toObject().toVariantMap();
+        const auto config = resp.value("config").toObject().toVariantMap();
+        summary->setText(renderSummary(inventory, preflight));
+        updateVmStopDecisionUi(config, inventory);
+
+        if (verbose) {
+            appendLog("Status:\n" + QString::fromUtf8(QJsonDocument(resp).toJson(QJsonDocument::Indented)));
+            appendLog(renderInventoryText(inventory));
+            appendLog(renderPreflightText(preflight));
+        }
+    }
+
     QString renderSummary(const QVariantMap &inventory, const QVariantMap &preflight) const {
         const bool ready = preflight.value("canEnterVm").toBool();
         const auto blockers = preflight.value("blockers").toList();
@@ -273,9 +357,56 @@ private:
         text += " | IOMMU: " + QString(preflight.value("compatibility").toMap().value("iommuEnabled").toBool() ? "enabled" : "missing");
         const auto nextBoot = inventory.value("nextBootMode").toString();
         if (!nextBoot.isEmpty()) text += " | Next boot: " + nextBoot;
+        if (inventory.value("vmStoppedAwaitingDecision").toBool()) text += " | VM stopped: decision needed";
         if (!blockers.isEmpty()) text += " | Blockers: " + QString::number(blockers.size());
         if (!warnings.isEmpty()) text += " | Warnings: " + QString::number(warnings.size());
         return text;
+    }
+
+    void updateVmStopDecisionUi(const QVariantMap &config, const QVariantMap &inventory) {
+        const bool awaiting = config.value("vmStoppedAwaitingDecision", inventory.value("vmStoppedAwaitingDecision")).toBool();
+        const QString stoppedVm = config.value("lastStoppedVm", inventory.value("lastStoppedVm")).toString();
+        const QString stoppedAt = config.value("lastStoppedAt", inventory.value("lastStoppedAt")).toString();
+        const QString nextBoot = inventory.value("nextBootMode").toString();
+        const bool hostRecoveryScheduled = nextBoot == "host" && inventory.value("currentMode").toString() == "vm";
+        if (awaiting) setVmStopDecisionButtons(true, true, true);
+        else if (hostRecoveryScheduled) setVmStopDecisionButtons(true, false, true);
+        else setVmStopDecisionButtons(false, false, false);
+
+        if (awaiting) {
+            QString text = "The configured VM has stopped, and the GPU is still assigned to VM/VFIO mode.";
+            if (!stoppedVm.isEmpty()) text += " VM: " + stoppedVm + ".";
+            if (!stoppedAt.isEmpty()) text += " Stopped at UTC: " + stoppedAt + ".";
+            text += " Choose whether to reboot now, restore host ownership on the next restart, or keep the GPU with the VM.";
+            vmStopStatus->setText(text);
+            statusBar()->showMessage("VM stopped; choose GPU recovery action");
+        } else {
+            if (nextBoot == "host") {
+                vmStopStatus->setText("Host recovery is scheduled for the next restart. The GPU will return to Linux when the machine reboots.");
+            } else {
+                vmStopStatus->setText("No stopped-VM decision is pending.");
+            }
+        }
+    }
+
+    void setVmStopDecisionEnabled(bool enabled) {
+        setVmStopDecisionButtons(enabled, enabled, enabled);
+    }
+
+    void setVmStopDecisionButtons(bool restartNow, bool nextRestart, bool keepVm) {
+        restartHostNowBtn->setEnabled(restartNow);
+        hostNextRestartBtn->setEnabled(nextRestart);
+        keepVmBtn->setEnabled(keepVm);
+    }
+
+    bool confirmReboot(const QString &title, const QString &message) {
+        const auto answer = QMessageBox::warning(
+            this,
+            title,
+            message,
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No);
+        return answer == QMessageBox::Yes;
     }
 
     void refreshFromConfig() {
@@ -297,6 +428,7 @@ private:
     }
 
     QLabel *summary{};
+    QLabel *vmStopStatus{};
     QLineEdit *vmName{};
     QLineEdit *vmUuid{};
     QLineEdit *gpuBdf{};
@@ -315,7 +447,12 @@ private:
     QPushButton *vmBtn{};
     QPushButton *hostBtn{};
     QPushButton *refreshBtn{};
+    QPushButton *restartHostNowBtn{};
+    QPushButton *hostNextRestartBtn{};
+    QPushButton *keepVmBtn{};
     QPlainTextEdit *log{};
+    QTimer *autoRefresh{};
+    QString lastStatusError;
 };
 
 int main(int argc, char **argv) {

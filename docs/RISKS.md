@@ -42,3 +42,28 @@ Even after the safety gates, inventory reporting, and reset logic are added, the
 **Symptom:** The GPU is rebound too late and the display manager starts first.
 
 **Fix:** Ensure `gpu-switcher-boot.service` is enabled and ordered before `display-manager.service` and `graphical.target`. If your distro starts a different display manager unit, add it to the unit ordering list.
+
+## 9) VM stop event is recorded but the GUI is not visible
+**Symptom:** The VM has stopped, but the host display is unavailable because the only GPU is still assigned to VFIO.
+
+**Fix:** Use SSH or another fallback path to run one of these commands:
+
+```bash
+# Reboot immediately and restore GPU ownership to Linux
+gpu-switcher-ctl restartHostNow
+
+# Restore GPU ownership to Linux on the next restart
+gpu-switcher-ctl returnHostNextRestart
+
+# Keep GPU ownership with VFIO/VM until changed later
+gpu-switcher-ctl keepGpuForVm
+```
+
+## 10) User chooses to keep the GPU assigned to the VM
+**Symptom:** After choosing **Keep GPU with VM**, the next normal boot may still leave the GPU bound for VM/VFIO use until the user manually chooses host recovery.
+
+**Fix:** Open the GUI and press **Reboot to Host**, or run:
+
+```bash
+gpu-switcher-ctl rebootToHost
+```

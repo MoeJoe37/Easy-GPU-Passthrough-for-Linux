@@ -4,6 +4,7 @@
 #include <QCoreApplication>
 #include <QLocalSocket>
 #include <QJsonDocument>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QDebug>
 
@@ -76,7 +77,7 @@ int main(int argc, char **argv) {
     QCoreApplication app(argc, argv);
     const auto args = app.arguments();
     if (args.size() < 2) {
-        qCritical() << "Usage: gpu-switcher-ctl <status|probe|inventory|diagnose|simulate|simulateVm|simulateHost|installHook|switchToVm|switchToHost|rebootToVm|rebootToHost|applyBootState|on-vm-stopped> [gpuBdf] [--json]";
+        qCritical() << "Usage: gpu-switcher-ctl <status|probe|inventory|diagnose|simulate|simulateVm|simulateHost|installHook|switchToVm|switchToHost|rebootToVm|rebootToHost|restartHostNow|returnHostNextRestart|keepGpuForVm|applyBootState|on-vm-stopped> [gpuBdf] [--json]";
         return 1;
     }
 
@@ -86,7 +87,7 @@ int main(int argc, char **argv) {
     const QString gpuBdf = hasGpuArg ? args.at(2) : QString();
 
     QJsonObject req;
-    if (cmd == "status" || cmd == "installHook" || cmd == "switchToVm" || cmd == "switchToHost" || cmd == "rebootToVm" || cmd == "rebootToHost" || cmd == "applyBootState") {
+    if (cmd == "status" || cmd == "installHook" || cmd == "switchToVm" || cmd == "switchToHost" || cmd == "rebootToVm" || cmd == "rebootToHost" || cmd == "restartHostNow" || cmd == "returnHostNextRestart" || cmd == "keepGpuForVm" || cmd == "applyBootState") {
         req = QJsonObject{{"cmd", cmd}};
     } else if (cmd == "probe") {
         if (gpuBdf.isEmpty()) {
@@ -99,6 +100,9 @@ int main(int argc, char **argv) {
         if (!gpuBdf.isEmpty()) req["gpuBdf"] = gpuBdf;
     } else if (cmd == "inventory") {
         req = QJsonObject{{"cmd", "inventory"}};
+    } else if (cmd == "simulate" || cmd == "simulateVm" || cmd == "simulateHost") {
+        req = QJsonObject{{"cmd", cmd}};
+        if (!gpuBdf.isEmpty()) req["gpuBdf"] = gpuBdf;
     } else if (cmd == "on-vm-stopped") {
         const QString domain = hasGpuArg ? args.at(2) : QString();
         req = QJsonObject{{"cmd", "onVmStopped"}, {"domain", domain}};
@@ -114,7 +118,7 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    if (jsonOut || (cmd != "inventory" && cmd != "diagnose" && cmd != "preflight")) {
+    if (jsonOut || (cmd != "inventory" && cmd != "diagnose" && cmd != "preflight" && !cmd.startsWith("simulate"))) {
         return printJson(resp);
     }
     return printTextForCommand(cmd, resp);

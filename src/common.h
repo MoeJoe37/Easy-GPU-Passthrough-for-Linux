@@ -33,6 +33,9 @@ struct AppConfig {
     bool hasFallbackDisplay = false;
     bool allowSingleGpu = false;
     bool autoStartVmOnBoot = true;
+    bool vmStoppedAwaitingDecision = false;
+    QString lastStoppedVm;
+    QString lastStoppedAt;
     QString mode = "host";
     QString originalGpuDriver;
     QString originalAudioDriver;

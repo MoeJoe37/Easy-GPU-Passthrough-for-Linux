@@ -10,6 +10,7 @@
 #include <QJsonObject>
 #include <QProcess>
 #include <QTimer>
+#include <QDateTime>
 #include <QDebug>
 
 using namespace gs;
@@ -75,18 +76,51 @@ static bool scheduleBootTransition(AppConfig cfg, const QString &target, QString
         return false;
     }
 
-    if (normalizeBootTarget(cfg.nextBootMode) == normalized) {
-        if (notes) notes->push_back("Boot intent already scheduled for " + normalized + " mode");
-        return true;
-    }
-
     cfg.nextBootMode = normalized;
+    cfg.vmStoppedAwaitingDecision = false;
     QString saveError;
     if (!saveConfig(cfg, &saveError) || !writeState("pending-" + normalized, &saveError)) {
         if (error) *error = saveError;
         return false;
     }
     if (notes) notes->push_back("Scheduled reboot into " + normalized + " mode");
+    return true;
+}
+
+static bool markVmStoppedAwaitingDecision(AppConfig cfg, const QString &domain, QStringList *notes, QString *error) {
+    if (!cfg.vmName.trimmed().isEmpty() && !domain.trimmed().isEmpty() && domain.trimmed() != cfg.vmName.trimmed()) {
+        if (notes) notes->push_back("Ignoring stopped VM " + domain + "; configured VM is " + cfg.vmName.trimmed());
+        return true;
+    }
+
+    cfg.vmStoppedAwaitingDecision = true;
+    cfg.lastStoppedVm = domain.trimmed().isEmpty() ? domainIdForConfig(cfg) : domain.trimmed();
+    cfg.lastStoppedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    cfg.nextBootMode.clear();
+    cfg.mode = "vm";
+
+    QString saveError;
+    if (!saveConfig(cfg, &saveError) || !writeState("vm-stopped-awaiting-decision", &saveError)) {
+        if (error) *error = saveError;
+        return false;
+    }
+    if (notes) {
+        notes->push_back("VM stopped; waiting for user recovery decision");
+        notes->push_back("Options: reboot to host now, restore host on next restart, or keep GPU assigned to VM");
+    }
+    return true;
+}
+
+static bool keepGpuAssignedToVm(AppConfig cfg, QStringList *notes, QString *error) {
+    cfg.vmStoppedAwaitingDecision = false;
+    cfg.nextBootMode.clear();
+    cfg.mode = "vm";
+    QString saveError;
+    if (!saveConfig(cfg, &saveError) || !writeState("vm", &saveError)) {
+        if (error) *error = saveError;
+        return false;
+    }
+    if (notes) notes->push_back("GPU ownership will stay with the VM until changed manually");
     return true;
 }
 
@@ -523,6 +557,7 @@ static bool applyBootIntent(QString *error, QStringList *notes) {
 
     cfg = sm.config();
     cfg.nextBootMode.clear();
+    cfg.vmStoppedAwaitingDecision = false;
     cfg.mode = target;
     QString saveError;
     if (!saveConfig(cfg, &saveError) || !writeState(target, &saveError)) {
@@ -550,6 +585,7 @@ public:
 
     bool start(QString *error) {
         QLocalServer::removeServer(socketPath());
+        server.setSocketOptions(QLocalServer::WorldAccessOption);
         if (!server.listen(socketPath())) {
             if (error) *error = server.errorString();
             return false;
@@ -615,6 +651,9 @@ private:
                     {"hasFallbackDisplay", cfg.hasFallbackDisplay},
                     {"allowSingleGpu", cfg.allowSingleGpu},
                     {"autoStartVmOnBoot", cfg.autoStartVmOnBoot},
+                    {"vmStoppedAwaitingDecision", cfg.vmStoppedAwaitingDecision},
+                    {"lastStoppedVm", cfg.lastStoppedVm},
+                    {"lastStoppedAt", cfg.lastStoppedAt},
                     {"mode", cfg.mode},
                     {"originalGpuDriver", cfg.originalGpuDriver},
                     {"originalAudioDriver", cfg.originalAudioDriver},
@@ -658,6 +697,9 @@ private:
                 cfg.hasFallbackDisplay = req.value("hasFallbackDisplay").toBool(cfg.hasFallbackDisplay);
                 cfg.allowSingleGpu = req.value("allowSingleGpu").toBool(cfg.allowSingleGpu);
                 cfg.autoStartVmOnBoot = req.value("autoStartVmOnBoot").toBool(cfg.autoStartVmOnBoot);
+                cfg.vmStoppedAwaitingDecision = req.value("vmStoppedAwaitingDecision").toBool(cfg.vmStoppedAwaitingDecision);
+                cfg.lastStoppedVm = req.value("lastStoppedVm").toString(cfg.lastStoppedVm);
+                cfg.lastStoppedAt = req.value("lastStoppedAt").toString(cfg.lastStoppedAt);
                 cfg.mode = req.value("mode").toString(cfg.mode.isEmpty() ? "host" : cfg.mode);
                 cfg.originalGpuDriver = req.value("originalGpuDriver").toString(cfg.originalGpuDriver);
                 cfg.originalAudioDriver = req.value("originalAudioDriver").toString(cfg.originalAudioDriver);
@@ -717,7 +759,7 @@ private:
                 continue;
             }
 
-            if (cmd == "onVmStopped") {
+            if (cmd == "returnHostNextRestart" || cmd == "returnHostNextBoot") {
                 QString err;
                 QStringList notes;
                 AppConfig cfg = loadConfig();
@@ -725,8 +767,47 @@ private:
                     sendJson(sock, errorReply(err));
                     continue;
                 }
-                notes << "VM stopped: host recovery will happen on next reboot";
-                sendJson(sock, okReply({{"mode", "pending-host"}, {"action", "await-reboot"}, {"notes", QJsonArray::fromStringList(notes)}}));
+                notes << "Host recovery will be applied on the next restart; no reboot was triggered now";
+                sendJson(sock, okReply({{"mode", "pending-host"}, {"action", "host-on-next-restart"}, {"notes", QJsonArray::fromStringList(notes)}}));
+                continue;
+            }
+
+            if (cmd == "restartHostNow" || cmd == "vmStoppedRestartHost") {
+                QString err;
+                QStringList notes;
+                AppConfig cfg = loadConfig();
+                if (!scheduleBootTransition(cfg, "host", &notes, &err)) {
+                    sendJson(sock, errorReply(err));
+                    continue;
+                }
+                notes << "Host recovery scheduled; reboot will start now";
+                sendJson(sock, okReply({{"mode", "pending-host"}, {"action", "reboot-now"}, {"notes", QJsonArray::fromStringList(notes)}}));
+                QTimer::singleShot(1500, []() { QProcess::startDetached("systemctl", {"reboot"}); });
+                continue;
+            }
+
+            if (cmd == "keepGpuForVm" || cmd == "vmStoppedKeepVm") {
+                QString err;
+                QStringList notes;
+                AppConfig cfg = loadConfig();
+                if (!keepGpuAssignedToVm(cfg, &notes, &err)) {
+                    sendJson(sock, errorReply(err));
+                    continue;
+                }
+                sendJson(sock, okReply({{"mode", "vm"}, {"action", "keep-vm"}, {"notes", QJsonArray::fromStringList(notes)}}));
+                continue;
+            }
+
+            if (cmd == "onVmStopped") {
+                QString err;
+                QStringList notes;
+                AppConfig cfg = loadConfig();
+                const QString domain = req.value("domain").toString();
+                if (!markVmStoppedAwaitingDecision(cfg, domain, &notes, &err)) {
+                    sendJson(sock, errorReply(err));
+                    continue;
+                }
+                sendJson(sock, okReply({{"mode", "vm-stopped-awaiting-decision"}, {"action", "await-user-choice"}, {"domain", domain}, {"notes", QJsonArray::fromStringList(notes)}}));
                 continue;
             }
 

@@ -144,6 +144,9 @@ AppConfig loadConfig(QString *error) {
     cfg.hasFallbackDisplay = s.value("hasFallbackDisplay", false).toBool();
     cfg.allowSingleGpu = s.value("allowSingleGpu", false).toBool();
     cfg.autoStartVmOnBoot = s.value("autoStartVmOnBoot", true).toBool();
+    cfg.vmStoppedAwaitingDecision = s.value("vmStoppedAwaitingDecision", false).toBool();
+    cfg.lastStoppedVm = s.value("lastStoppedVm").toString();
+    cfg.lastStoppedAt = s.value("lastStoppedAt").toString();
     cfg.mode = s.value("mode", "host").toString();
     cfg.originalGpuDriver = s.value("originalGpuDriver").toString();
     cfg.originalAudioDriver = s.value("originalAudioDriver").toString();
@@ -174,6 +177,9 @@ bool saveConfig(const AppConfig &cfg, QString *error) {
     s.setValue("hasFallbackDisplay", cfg.hasFallbackDisplay);
     s.setValue("allowSingleGpu", cfg.allowSingleGpu);
     s.setValue("autoStartVmOnBoot", cfg.autoStartVmOnBoot);
+    s.setValue("vmStoppedAwaitingDecision", cfg.vmStoppedAwaitingDecision);
+    s.setValue("lastStoppedVm", cfg.lastStoppedVm);
+    s.setValue("lastStoppedAt", cfg.lastStoppedAt);
     s.setValue("mode", cfg.mode);
     s.setValue("originalGpuDriver", cfg.originalGpuDriver);
     s.setValue("originalAudioDriver", cfg.originalAudioDriver);
@@ -668,6 +674,8 @@ QVariantMap reportToMap(const CompatibilityReport &r) {
     return m;
 }
 
+static bool vmXmlHasHiddenKvmState(const QString &xml);
+
 CompatibilityReport buildCompatibilityReport(const AppConfig &cfg) {
     CompatibilityReport r;
     QString detail;
@@ -743,6 +751,10 @@ QVariantMap preflightToMap(const PreflightReport &r) {
         {"useVendorReset", r.config.useVendorReset},
         {"hasFallbackDisplay", r.config.hasFallbackDisplay},
         {"allowSingleGpu", r.config.allowSingleGpu},
+        {"autoStartVmOnBoot", r.config.autoStartVmOnBoot},
+        {"vmStoppedAwaitingDecision", r.config.vmStoppedAwaitingDecision},
+        {"lastStoppedVm", r.config.lastStoppedVm},
+        {"lastStoppedAt", r.config.lastStoppedAt},
         {"mode", r.config.mode},
         {"originalGpuDriver", r.config.originalGpuDriver},
         {"originalAudioDriver", r.config.originalAudioDriver},
@@ -947,6 +959,9 @@ QVariantMap systemInventoryToMap() {
     inv["preferredBoot"] = cfg.preferredBoot;
     inv["nextBootMode"] = cfg.nextBootMode;
     inv["autoStartVmOnBoot"] = cfg.autoStartVmOnBoot;
+    inv["vmStoppedAwaitingDecision"] = cfg.vmStoppedAwaitingDecision;
+    inv["lastStoppedVm"] = cfg.lastStoppedVm;
+    inv["lastStoppedAt"] = cfg.lastStoppedAt;
     QVariantList devices;
     for (const auto &bdf : allGraphicsControllers(nullptr)) {
         const DeviceInfo d = inspectDevice(bdf);
@@ -979,6 +994,10 @@ QString renderInventoryText(const QVariantMap &inventory) {
     ts << "Preferred boot: " << inventory.value("preferredBoot").toString() << "\n";
     ts << "Next boot target: " << (inventory.value("nextBootMode").toString().isEmpty() ? "(none)" : inventory.value("nextBootMode").toString()) << "\n";
     ts << "Auto-start VM on boot: " << (inventory.value("autoStartVmOnBoot").toBool() ? "enabled" : "disabled") << "\n";
+    ts << "VM stopped awaiting decision: " << (inventory.value("vmStoppedAwaitingDecision").toBool() ? "yes" : "no") << "\n";
+    if (!inventory.value("lastStoppedVm").toString().isEmpty()) {
+        ts << "Last stopped VM: " << inventory.value("lastStoppedVm").toString() << " at " << inventory.value("lastStoppedAt").toString() << "\n";
+    }
     const auto devices = inventory.value("graphicsDevices").toList();
     ts << "\nGraphics devices:\n";
     for (const auto &v : devices) {
