@@ -37,7 +37,10 @@ cmake --build build -j
 ```bash
 sudo install -m 0755 build/gpu-switcher-helperd /usr/local/bin/
 sudo install -m 0755 build/gpu-switcher-gui /usr/local/bin/
-sudo install -m 0755 build/gpu-switcher-ctl /usr/local/bin/
+sudo install -m 0755 build/gsc /usr/local/bin/
+sudo install -m 0755 build/gpu-switcher-ctl /usr/local/bin/   # optional legacy CLI name
+
+# `gsc` is the preferred CLI command. `gpu-switcher-ctl` is kept for compatibility.
 
 sudo install -m 0644 systemd/gpu-switcher-helperd.service /etc/systemd/system/
 sudo install -m 0644 systemd/gpu-switcher-boot.service /etc/systemd/system/
@@ -69,24 +72,24 @@ For single-GPU hosts:
 CLI equivalent:
 
 ```bash
-gpu-switcher-ctl autoSetupSingleGpu
-gpu-switcher-ctl diagnose
-gpu-switcher-ctl rebootToVm
+gsc autoSetupSingleGpu
+gsc diagnose
+gsc rebootToVm
 ```
 
 ## Recovery commands
 
 ```bash
-gpu-switcher-ctl restartHostNow
-gpu-switcher-ctl returnHostNextRestart
-gpu-switcher-ctl keepGpuForVm
-gpu-switcher-ctl safetyRecoverHostNow
-gpu-switcher-ctl rebootToHost
+gsc restartHostNow
+gsc returnHostNextRestart
+gsc keepGpuForVm
+gsc safetyRecoverHostNow
+gsc rebootToHost
 ```
 
 ## Safety defaults
 
-Version 2.4.0 enables these defaults during auto setup:
+Auto setup enables these safety defaults:
 
 - `thermalGuardEnabled=true`
 - `maxGpuTempC=85`

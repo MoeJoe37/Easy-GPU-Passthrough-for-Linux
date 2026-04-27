@@ -20,7 +20,7 @@ static const QString kState = kAppDir + "/state.txt";
 static const QString kSock = "/run/gpu-switcher.sock";
 static const QString kHook = "/etc/libvirt/hooks/qemu";
 static const QString kHelper = "/usr/local/bin/gpu-switcher-helperd";
-static const QString kCtl = "/usr/local/bin/gpu-switcher-ctl";
+static const QString kCtl = "/usr/local/bin/gsc";
 static const QString kBackupDir = kAppDir + "/backups";
 
 QString configPath() { return kCfg; }

@@ -62,6 +62,17 @@ static void runBestEffort(const QString &program, const QStringList &args, QStri
 }
 
 
+static QString ctlCommandPath() {
+    const QFileInfo primary(ctlBinaryPath());
+    if (primary.isExecutable()) return primary.absoluteFilePath();
+
+    const QString legacy = "/usr/local/bin/gpu-switcher-ctl";
+    const QFileInfo legacyInfo(legacy);
+    if (legacyInfo.isExecutable()) return legacyInfo.absoluteFilePath();
+
+    return ctlBinaryPath();
+}
+
 static void cancelSafetyRecovery(QStringList *notes) {
     runBestEffort("systemctl", {"stop", "gpu-switcher-safety-recover.timer", "gpu-switcher-safety-recover.service"}, notes, 5000);
     runBestEffort("systemctl", {"reset-failed", "gpu-switcher-safety-recover.timer", "gpu-switcher-safety-recover.service"}, notes, 5000);
@@ -80,7 +91,7 @@ static void scheduleSafetyRecoveryTimer(const AppConfig &cfg, QStringList *notes
                   {"--unit=gpu-switcher-safety-recover",
                    "--collect",
                    "--on-active=" + delay,
-                   "/usr/local/bin/gpu-switcher-ctl",
+                   ctlCommandPath(),
                    "safetyRecoverHostNow"},
                   notes,
                   10000);
@@ -467,7 +478,9 @@ SUBOP="${3:-}"
 # or keep-vfio from the GUI/CLI.
 case "${OP}:${SUBOP}" in
   stopped:end|release:end)
-    if [[ -x /usr/local/bin/gpu-switcher-ctl ]]; then
+    if [[ -x /usr/local/bin/gsc ]]; then
+      /usr/local/bin/gsc on-vm-stopped "${DOMAIN}" || true
+    elif [[ -x /usr/local/bin/gpu-switcher-ctl ]]; then
       /usr/local/bin/gpu-switcher-ctl on-vm-stopped "${DOMAIN}" || true
     fi
     ;;

@@ -1,5 +1,14 @@
 # Release notes
 
+## 2.5.0
+
+### Changed
+
+- Added the short `gsc` CLI binary while keeping `gpu-switcher-ctl` as a legacy-compatible target.
+- `sudo gsc ...` now auto-starts `gpu-switcher-helperd` when the helper socket is not already available.
+- Helper-generated libvirt hooks and safety timers now prefer `/usr/local/bin/gsc` and fall back to `/usr/local/bin/gpu-switcher-ctl` when needed.
+- Updated README and build documentation to use the shorter CLI command.
+
 ## 2.4.0
 
 ### Safety hardening
@@ -13,9 +22,9 @@
 - Preflight warns when Linux cannot read a GPU temperature sensor, because VFIO/guest ownership can hide host-side thermal telemetry.
 - Preflight warns when the thermal guard or VM-stop safety timer is disabled.
 - When the VM stops, the app now schedules Host recovery for the next restart by default.
-- When the VM stops, the app arms a transient systemd timer that calls `gpu-switcher-ctl safetyRecoverHostNow` after the configured grace period.
+- When the VM stops, the app arms a transient systemd timer that calls `gsc safetyRecoverHostNow` after the configured grace period.
 - **Keep GPU with VM** now explicitly cancels the safety recovery timer and warns that this should only be used when guest/firmware cooling is confirmed.
-- Added CLI command `gpu-switcher-ctl safetyRecoverHostNow` for the transient safety timer.
+- Added CLI command `gsc safetyRecoverHostNow` for the transient safety timer.
 - Updated `docs/RISKS.md` with thermal/idle-VFIO risks and mitigations.
 
 ### Notes
@@ -28,7 +37,7 @@
 ### Added
 
 - Added **Auto setup single GPU** GUI action.
-- Added `gpu-switcher-ctl autoSetupSingleGpu [gpuBdf]`.
+- Added `gsc autoSetupSingleGpu [gpuBdf]`.
 - Auto-detects the only graphics controller when no GPU BDF is provided.
 - Auto-detects the HDMI/DP audio companion function from the same IOMMU group when possible.
 - Automatically enables the explicit single-GPU acknowledgement during auto setup.

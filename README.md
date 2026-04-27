@@ -47,9 +47,9 @@ The helper will:
 CLI equivalent:
 
 ```bash
-gpu-switcher-ctl autoSetupSingleGpu
+gsc autoSetupSingleGpu
 # or, when more than one GPU exists:
-gpu-switcher-ctl autoSetupSingleGpu 0000:01:00.0
+gsc autoSetupSingleGpu 0000:01:00.0
 ```
 
 ### 2. Linux host → Windows VM
@@ -73,7 +73,7 @@ The helper will:
 The libvirt QEMU hook calls:
 
 ```bash
-gpu-switcher-ctl on-vm-stopped <domain>
+gsc on-vm-stopped <domain>
 ```
 
 The helper does not try an unsafe live handoff back to Linux. It records the stopped-VM decision, schedules Host recovery for the next restart, and arms the safety timer:
@@ -89,11 +89,11 @@ The GUI/CLI then gives three choices:
 
 | GUI option | CLI command | What it does |
 |---|---|---|
-| **Restart now to Host** | `gpu-switcher-ctl restartHostNow` | Schedules `nextBootMode=host` and immediately reboots. On the next boot, the GPU is rebound to the original Linux driver. |
-| **Return on next restart** | `gpu-switcher-ctl returnHostNextRestart` | Keeps `nextBootMode=host` but does **not** reboot now. The GPU returns to Linux whenever the user restarts later. |
-| **Keep GPU with VM** | `gpu-switcher-ctl keepGpuForVm` | Clears the stopped-VM warning, cancels the safety timer, and keeps the GPU assigned to VM/VFIO mode until the user manually chooses **Reboot to Host**. |
+| **Restart now to Host** | `gsc restartHostNow` | Schedules `nextBootMode=host` and immediately reboots. On the next boot, the GPU is rebound to the original Linux driver. |
+| **Return on next restart** | `gsc returnHostNextRestart` | Keeps `nextBootMode=host` but does **not** reboot now. The GPU returns to Linux whenever the user restarts later. |
+| **Keep GPU with VM** | `gsc keepGpuForVm` | Clears the stopped-VM warning, cancels the safety timer, and keeps the GPU assigned to VM/VFIO mode until the user manually chooses **Reboot to Host**. |
 
-If no user action is taken and `safetyAutoRecoveryMinutes` is greater than zero, the transient systemd timer calls `gpu-switcher-ctl safetyRecoverHostNow` and reboots back to Host mode. On a real single-GPU system, the local Linux GUI may not be visible after the VM closes because the GPU is still assigned to VFIO. Keep SSH, another remote path, or a known reboot shortcut available.
+If no user action is taken and `safetyAutoRecoveryMinutes` is greater than zero, the transient systemd timer calls `gsc safetyRecoverHostNow` and reboots back to Host mode. On a real single-GPU system, the local Linux GUI may not be visible after the VM closes because the GPU is still assigned to VFIO. Keep SSH, another remote path, or a known reboot shortcut available.
 
 ### 4. Windows VM / VFIO → Linux host
 
@@ -178,7 +178,8 @@ cmake --build build -j
 ```bash
 sudo install -m 0755 build/gpu-switcher-helperd /usr/local/bin/
 sudo install -m 0755 build/gpu-switcher-gui /usr/local/bin/
-sudo install -m 0755 build/gpu-switcher-ctl /usr/local/bin/
+sudo install -m 0755 build/gsc /usr/local/bin/
+sudo install -m 0755 build/gpu-switcher-ctl /usr/local/bin/   # optional legacy CLI name
 sudo install -m 0644 systemd/gpu-switcher-helperd.service /etc/systemd/system/
 sudo install -m 0644 systemd/gpu-switcher-boot.service /etc/systemd/system/
 sudo install -m 0755 hooks/qemu /etc/libvirt/hooks/qemu
@@ -189,19 +190,21 @@ sudo systemctl enable --now gpu-switcher-helperd.service gpu-switcher-boot.servi
 ## CLI commands
 
 ```bash
-gpu-switcher-ctl status
-gpu-switcher-ctl inventory
-gpu-switcher-ctl diagnose [gpuBdf]
-gpu-switcher-ctl autoSetupSingleGpu [gpuBdf]
-gpu-switcher-ctl simulateVm [gpuBdf]
-gpu-switcher-ctl rebootToVm
-gpu-switcher-ctl rebootToHost
-gpu-switcher-ctl restartHostNow
-gpu-switcher-ctl returnHostNextRestart
-gpu-switcher-ctl keepGpuForVm
-gpu-switcher-ctl safetyRecoverHostNow
-gpu-switcher-ctl on-vm-stopped <domain>
+gsc status
+gsc inventory
+gsc diagnose [gpuBdf]
+gsc autoSetupSingleGpu [gpuBdf]
+gsc simulateVm [gpuBdf]
+gsc rebootToVm
+gsc rebootToHost
+gsc restartHostNow
+gsc returnHostNextRestart
+gsc keepGpuForVm
+gsc safetyRecoverHostNow
+gsc on-vm-stopped <domain>
 ```
+
+`gsc` is the preferred CLI name. `gpu-switcher-ctl` is still built and installable as a compatibility command for older scripts. When run as `sudo gsc ...`, the CLI can auto-start `gpu-switcher-helperd` if the systemd service is not already listening.
 
 ### Important commands
 
@@ -231,7 +234,7 @@ gpu-switcher-ctl on-vm-stopped <domain>
 
 ## Version
 
-Current project version: **2.4.0**.
+Current project version: **2.5.0**.
 
 ## Release status
 

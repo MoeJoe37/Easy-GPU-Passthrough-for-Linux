@@ -40,7 +40,7 @@ Important boundary: this app does not overclock, undervolt, change GPU power lim
 
 **Symptom:** The VM stopped, but the GPU is still assigned to VFIO/VM mode.
 
-**Status in app:** Mitigated. The hook records a stopped-VM decision, schedules Host recovery for the next restart by default, and arms a transient systemd safety timer. If the user does nothing, the timer calls `gpu-switcher-ctl safetyRecoverHostNow` and reboots back to Host mode.
+**Status in app:** Mitigated. The hook records a stopped-VM decision, schedules Host recovery for the next restart by default, and arms a transient systemd safety timer. If the user does nothing, the timer calls `gsc safetyRecoverHostNow` and reboots back to Host mode.
 
 **User fix:** Choose **Restart now to Host** for the safest path. Choose **Return on next restart** only if you intentionally want to delay the reboot. Choose **Keep GPU with VM** only when you have verified guest/firmware cooling and understand that this cancels the safety timer.
 
@@ -74,7 +74,7 @@ Important boundary: this app does not overclock, undervolt, change GPU power lim
 
 **Status in app:** Mitigated. The helper records the original GPU/audio drivers, clears `driver_override`, reloads common driver modules, tries direct bind, then remove/rescan fallback.
 
-**User fix:** Use **Restart now to Host** or `gpu-switcher-ctl rebootToHost`. If the card is still wedged, power-cycle the PC.
+**User fix:** Use **Restart now to Host** or `gsc rebootToHost`. If the card is still wedged, power-cycle the PC.
 
 ## 10) Boot service does not run early enough
 
@@ -100,13 +100,13 @@ If the distro uses a nonstandard display manager unit, add equivalent ordering o
 
 ```bash
 # Reboot immediately and restore GPU ownership to Linux
-gpu-switcher-ctl restartHostNow
+gsc restartHostNow
 
 # Restore GPU ownership to Linux on the next restart
-gpu-switcher-ctl returnHostNextRestart
+gsc returnHostNextRestart
 
 # Keep GPU ownership with VFIO/VM until changed later; cancels safety timer
-gpu-switcher-ctl keepGpuForVm
+gsc keepGpuForVm
 ```
 
 ## 12) User disables thermal guard or auto recovery
