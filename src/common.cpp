@@ -20,7 +20,7 @@ static const QString kState = kAppDir + "/state.txt";
 static const QString kSock = "/run/gpu-switcher.sock";
 static const QString kHook = "/etc/libvirt/hooks/qemu";
 static const QString kHelper = "/usr/local/bin/gpu-switcher-helperd";
-static const QString kCtl = "/usr/local/bin/gsc";
+static const QString kCtl = "/usr/local/bin/gpu-switcher-ctl";
 static const QString kBackupDir = kAppDir + "/backups";
 
 QString configPath() { return kCfg; }
@@ -287,6 +287,132 @@ bool singleGPUOnly(QString gpuBdf, QString *detail) {
     const bool single = (gfx.size() <= 1) || (gfx.size() == 1 && normalizeBdf(gfx.first()) == gpu);
     if (detail) *detail = info + (single ? " (single-GPU path)" : " (multi-GPU path)");
     return single;
+}
+
+static bool chassisTypeIsPortable(const QString &type) {
+    bool ok = false;
+    const int t = type.trimmed().toInt(&ok);
+    if (!ok) return false;
+    // SMBIOS/DMI chassis types commonly used for portable systems:
+    // 8 Portable, 9 Laptop, 10 Notebook, 14 Sub Notebook,
+    // 30 Tablet, 31 Convertible, 32 Detachable.
+    return t == 8 || t == 9 || t == 10 || t == 14 || t == 30 || t == 31 || t == 32;
+}
+
+static bool batteryPresent() {
+    QDir ps("/sys/class/power_supply");
+    if (!ps.exists()) return false;
+    const auto entries = ps.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+    for (const auto &e : entries) {
+        if (e.startsWith("BAT", Qt::CaseInsensitive)) return true;
+        const QString type = readText(ps.absoluteFilePath(e + "/type"));
+        if (type.compare("Battery", Qt::CaseInsensitive) == 0) return true;
+    }
+    return false;
+}
+
+static QStringList drmCardsForPciDevice(const QString &bdf) {
+    QStringList cards;
+    const QString normalized = normalizeBdf(bdf);
+    if (normalized.isEmpty()) return cards;
+
+    QDir drm("/sys/class/drm");
+    if (!drm.exists()) return cards;
+    static const QRegularExpression cardRe(R"(^card\d+$)");
+    const auto entries = drm.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+    for (const auto &entry : entries) {
+        if (!cardRe.match(entry).hasMatch()) continue;
+        QFileInfo devLink(drm.absoluteFilePath(entry + "/device"));
+        if (!devLink.exists()) continue;
+        const QString target = QFile::symLinkTarget(devLink.absoluteFilePath());
+        if (target.isEmpty()) continue;
+        if (QFileInfo(target).fileName().compare(normalized, Qt::CaseInsensitive) == 0) {
+            cards << entry;
+        }
+    }
+    cards.removeDuplicates();
+    return cards;
+}
+
+static bool connectorLooksInternal(const QString &name) {
+    const QString lower = name.toLower();
+    return lower.contains("edp") || lower.contains("lvds") || lower.contains("dsi") || lower.contains("dpi");
+}
+
+static bool connectorLooksActive(const QString &connectorPath) {
+    const QString status = readText(connectorPath + "/status").toLower();
+    const QString enabled = readText(connectorPath + "/enabled").toLower();
+    return status == "connected" || enabled == "enabled" || enabled == "1";
+}
+
+LaptopSafetyInfo inspectLaptopSafety(const QString &targetGpuBdf) {
+    LaptopSafetyInfo info;
+    info.chassisType = readText("/sys/class/dmi/id/chassis_type");
+    info.chassisLooksPortable = chassisTypeIsPortable(info.chassisType);
+    info.batteryPresent = batteryPresent();
+    info.likelyLaptop = info.chassisLooksPortable || info.batteryPresent;
+
+    const QString target = normalizeBdf(targetGpuBdf);
+    const auto gfx = allGraphicsControllers(nullptr);
+    info.targetIsOnlyGraphicsController = gfx.size() <= 1 || (gfx.size() == 1 && normalizeBdf(gfx.first()) == target);
+    info.targetDrmCards = drmCardsForPciDevice(target);
+    info.targetHasDrmCard = !info.targetDrmCards.isEmpty();
+
+    QDir drm("/sys/class/drm");
+    for (const auto &card : info.targetDrmCards) {
+        const auto connectors = drm.entryList(QStringList{card + "-*"}, QDir::Dirs | QDir::NoDotAndDotDot);
+        for (const auto &connector : connectors) {
+            const QString path = drm.absoluteFilePath(connector);
+            if (!connectorLooksActive(path)) continue;
+            info.activeConnectors << connector;
+            if (connectorLooksInternal(connector)) {
+                info.internalConnectors << connector;
+            } else {
+                info.externalConnectors << connector;
+            }
+        }
+    }
+
+    info.activeConnectors.removeDuplicates();
+    info.internalConnectors.removeDuplicates();
+    info.externalConnectors.removeDuplicates();
+    info.targetDrivesActiveDisplay = !info.activeConnectors.isEmpty();
+    info.targetDrivesInternalPanel = !info.internalConnectors.isEmpty();
+    info.targetHasExternalConnectedDisplay = !info.externalConnectors.isEmpty();
+    info.targetAppearsSafeHybridOffload = info.likelyLaptop
+        && !info.targetIsOnlyGraphicsController
+        && info.targetHasDrmCard
+        && !info.targetDrivesActiveDisplay;
+
+    if (!info.likelyLaptop) {
+        info.summary = "Not detected as a laptop/portable chassis";
+        return info;
+    }
+
+    if (target.isEmpty()) {
+        info.blockers << "No target GPU PCI address is configured, so laptop display ownership cannot be checked";
+    } else if (!info.targetHasDrmCard) {
+        info.blockers << "The target GPU could not be mapped to a DRM/KMS card; the app cannot prove whether it drives the laptop panel";
+    } else if (info.targetDrivesInternalPanel) {
+        info.blockers << "The target GPU currently drives the internal laptop panel: " + info.internalConnectors.join(", ");
+    } else if (info.targetDrivesActiveDisplay) {
+        info.warnings << "The target GPU currently drives active display connector(s): " + info.activeConnectors.join(", ");
+    } else if (info.targetAppearsSafeHybridOffload) {
+        info.summary = "Laptop hybrid/offload candidate: target GPU has no active DRM connector; Linux display appears to be on another GPU";
+    }
+
+    if (info.summary.isEmpty()) {
+        if (info.targetDrivesInternalPanel) {
+            info.summary = "High-risk laptop path: target GPU owns the internal panel";
+        } else if (info.targetDrivesActiveDisplay) {
+            info.summary = "Laptop path needs caution: target GPU owns at least one active display output";
+        } else if (!info.targetHasDrmCard) {
+            info.summary = "Laptop path unknown: target GPU display ownership could not be verified";
+        } else {
+            info.summary = "Laptop path looks usable: target GPU is not driving an active display";
+        }
+    }
+    return info;
 }
 
 bool iommuGroupIsSafe(const QString &gpuBdf, QStringList *reasons) {
@@ -723,6 +849,20 @@ QVariantMap reportToMap(const CompatibilityReport &r) {
     m["sshdActive"] = r.sshdActive;
     m["nvidiaHiddenState"] = r.nvidiaHiddenState;
     m["gpuHasAudioCompanion"] = r.gpuHasAudioCompanion;
+    m["likelyLaptop"] = r.likelyLaptop;
+    m["laptopTargetHasDrmCard"] = r.laptopTargetHasDrmCard;
+    m["laptopTargetDrivesDisplay"] = r.laptopTargetDrivesDisplay;
+    m["laptopTargetDrivesInternalPanel"] = r.laptopTargetDrivesInternalPanel;
+    m["laptopTargetHasExternalConnectedDisplay"] = r.laptopTargetHasExternalConnectedDisplay;
+    m["laptopTargetAppearsSafeHybridOffload"] = r.laptopTargetAppearsSafeHybridOffload;
+    m["laptopChassisType"] = r.laptopChassisType;
+    m["laptopSafetySummary"] = r.laptopSafetySummary;
+    m["laptopTargetDrmCards"] = r.laptopTargetDrmCards;
+    m["laptopActiveConnectors"] = r.laptopActiveConnectors;
+    m["laptopInternalConnectors"] = r.laptopInternalConnectors;
+    m["laptopExternalConnectors"] = r.laptopExternalConnectors;
+    m["laptopBlockers"] = r.laptopBlockers;
+    m["laptopWarnings"] = r.laptopWarnings;
     m["gpuTemperatureReadable"] = r.gpuTemperatureReadable;
     m["gpuTemperatureC"] = r.gpuTemperatureC;
     m["gpuTemperaturePath"] = r.gpuTemperaturePath;
@@ -773,16 +913,46 @@ CompatibilityReport buildCompatibilityReport(const AppConfig &cfg) {
     }
 
     r.groupSafe = cfg.gpuBdf.isEmpty() ? false : iommuGroupIsSafe(cfg.gpuBdf, &r.reasons);
-    r.hasFallbackDisplay = cfg.hasFallbackDisplay || systemHasFallbackDisplay(&detail);
+
+    const LaptopSafetyInfo laptop = inspectLaptopSafety(cfg.gpuBdf);
+    r.likelyLaptop = laptop.likelyLaptop;
+    r.laptopTargetHasDrmCard = laptop.targetHasDrmCard;
+    r.laptopTargetDrivesDisplay = laptop.targetDrivesActiveDisplay;
+    r.laptopTargetDrivesInternalPanel = laptop.targetDrivesInternalPanel;
+    r.laptopTargetHasExternalConnectedDisplay = laptop.targetHasExternalConnectedDisplay;
+    r.laptopTargetAppearsSafeHybridOffload = laptop.targetAppearsSafeHybridOffload;
+    r.laptopChassisType = laptop.chassisType;
+    r.laptopSafetySummary = laptop.summary;
+    r.laptopTargetDrmCards = laptop.targetDrmCards;
+    r.laptopActiveConnectors = laptop.activeConnectors;
+    r.laptopInternalConnectors = laptop.internalConnectors;
+    r.laptopExternalConnectors = laptop.externalConnectors;
+    r.laptopBlockers = laptop.blockers;
+    r.laptopWarnings = laptop.warnings;
+
     r.displayManagerActive = displayManagerActive(&detail);
     r.sshdActive = sshdActive(&detail);
     r.secureBootEnabled = secureBootEnabled(&detail);
-    r.singleGraphicsPath = cfg.gpuBdf.isEmpty() ? false : singleGPUOnly(cfg.gpuBdf, &detail);
+
+    const bool genericMultiGpuFallback = systemHasFallbackDisplay(&detail);
+    const bool laptopHybridFallback = r.likelyLaptop && r.laptopTargetAppearsSafeHybridOffload;
+    r.hasFallbackDisplay = cfg.hasFallbackDisplay
+        || (!r.likelyLaptop && genericMultiGpuFallback)
+        || laptopHybridFallback;
+
+    const bool normalSingleGpu = cfg.gpuBdf.isEmpty() ? false : singleGPUOnly(cfg.gpuBdf, &detail);
+    r.singleGraphicsPath = normalSingleGpu || (r.likelyLaptop && r.laptopTargetDrivesDisplay);
+
+    if (r.likelyLaptop) {
+        r.warnings << "Laptop compatibility: " + r.laptopSafetySummary;
+        for (const auto &b : r.laptopBlockers) r.reasons << "Laptop safety blocker: " + b;
+        for (const auto &w : r.laptopWarnings) r.warnings << "Laptop safety warning: " + w;
+    }
 
     if (r.singleGraphicsPath && !cfg.hasFallbackDisplay && !cfg.allowSingleGpu) {
-        r.warnings << "Single-GPU systems need a second display path, SSH access, or explicit acknowledgement.";
+        r.warnings << "Single-GPU/display-owner path needs a second display path, SSH access, or explicit acknowledgement.";
     }
-    if (!cfg.hasFallbackDisplay && !r.sshdActive) {
+    if (!cfg.hasFallbackDisplay && !r.sshdActive && !r.hasFallbackDisplay) {
         r.warnings << "Fallback display / SSH recovery is not confirmed.";
     }
 
@@ -869,7 +1039,7 @@ PreflightReport buildPreflightReport(const AppConfig &cfg) {
         else r.notes.push_back(title + ": " + detail);
     };
 
-    r.stages = {"validate-config", "detect-vendor", "check-iommu", "check-group", "check-reset", "check-thermal-guard", "check-libvirt", "check-host-recovery"};
+    r.stages = {"validate-config", "detect-vendor", "check-iommu", "check-group", "check-reset", "check-laptop-topology", "check-thermal-guard", "check-libvirt", "check-host-recovery"};
 
     if (!isPciBdf(cfg.gpuBdf)) {
         addFinding(DiagnosticSeverity::Blocker, "invalid-gpu-bdf", "GPU PCI address is invalid", cfg.gpuBdf, "Enter a PCI address in the form 0000:01:00.0");
@@ -887,9 +1057,45 @@ PreflightReport buildPreflightReport(const AppConfig &cfg) {
         addFinding(DiagnosticSeverity::Blocker, "unsafe-iommu-group", "IOMMU group is not safe", "The GPU shares a group with unrelated hardware", "Move the card to a slot with proper ACS separation or use a board/firmware with safer isolation");
     }
     if (r.compatibility.singleGraphicsPath && !cfg.hasFallbackDisplay && !cfg.allowSingleGpu) {
-        addFinding(DiagnosticSeverity::Blocker, "single-gpu-path", "Single-GPU passthrough is not acknowledged", "The host appears to have only one graphics path", "Provide an iGPU, second GPU, or SSH/headless recovery and explicitly enable the acknowledgement");
+        addFinding(DiagnosticSeverity::Blocker, "single-gpu-path", "Single-GPU/display-owner passthrough is not acknowledged", "The selected GPU appears to be the only graphics path or currently owns a laptop display", "Use hybrid/iGPU mode, add a second display path, enable SSH/headless recovery, and explicitly enable the acknowledgement");
     } else if (r.compatibility.singleGraphicsPath) {
-        addFinding(DiagnosticSeverity::Warning, "single-gpu-fragile", "Single-GPU mode is fragile", "The host may lose the display during VM ownership", "Keep SSH or another recovery path active and expect reboot fallback");
+        addFinding(DiagnosticSeverity::Warning, "single-gpu-fragile", "Single-GPU/display-owner mode is fragile", "The host may lose the display during VM ownership", "Keep SSH or another recovery path active and expect reboot fallback");
+    }
+
+    if (r.compatibility.likelyLaptop) {
+        addFinding(DiagnosticSeverity::Info, "laptop-detected", "Laptop/portable system detected", r.compatibility.laptopSafetySummary, "Use hybrid/iGPU mode when possible; use Looking Glass/RDP/external output for the VM display");
+
+        if (!r.compatibility.laptopTargetHasDrmCard && cfg.mode != "vm") {
+            addFinding(DiagnosticSeverity::Blocker, "laptop-display-ownership-unknown", "Laptop display ownership cannot be verified", "The target GPU was not mapped to a DRM/KMS card, so the app cannot prove it is not driving the laptop panel", "Do not continue until the GPU is visible as a DRM card in host mode or configure the machine manually with SSH recovery");
+        }
+
+        if (r.compatibility.laptopTargetDrivesInternalPanel) {
+            if (cfg.allowSingleGpu) {
+                addFinding(DiagnosticSeverity::Warning, "laptop-panel-on-target-gpu", "Laptop internal panel is attached to the target GPU", "Active internal connector(s): " + r.compatibility.laptopInternalConnectors.join(", "), "This is single-GPU laptop mode; keep SSH/reboot recovery and expect the Linux GUI to disappear while the VM owns the GPU");
+            } else {
+                addFinding(DiagnosticSeverity::Blocker, "laptop-panel-on-target-gpu", "Laptop internal panel is attached to the target GPU", "Active internal connector(s): " + r.compatibility.laptopInternalConnectors.join(", "), "Switch the laptop to hybrid/iGPU mode in firmware/vendor tools, or explicitly enable single-GPU mode only with SSH/reboot recovery");
+            }
+            if (!r.compatibility.sshdActive && !cfg.hasFallbackDisplay) {
+                addFinding(DiagnosticSeverity::Blocker, "laptop-no-recovery-path", "No safe laptop recovery path is confirmed", "The target GPU owns the laptop panel and SSH/fallback display is not active or confirmed", "Enable SSH, confirm another display path, or do not run passthrough on this laptop");
+            }
+        } else if (r.compatibility.laptopTargetDrivesDisplay) {
+            addFinding(DiagnosticSeverity::Warning, "laptop-target-active-output", "Target GPU owns an active display output", "Active connector(s): " + r.compatibility.laptopActiveConnectors.join(", "), "Confirm the Linux desktop is not solely relying on that output before passthrough");
+            if (!r.compatibility.sshdActive && !cfg.hasFallbackDisplay) {
+                addFinding(DiagnosticSeverity::Blocker, "laptop-active-output-no-recovery", "Laptop active-output passthrough has no confirmed recovery path", "The target GPU owns at least one active display output and SSH/fallback display is not confirmed", "Confirm another Linux display path or enable SSH before trying this mode");
+            }
+        } else if (r.compatibility.laptopTargetAppearsSafeHybridOffload) {
+            addFinding(DiagnosticSeverity::Info, "laptop-hybrid-safe-candidate", "Hybrid laptop mode looks usable", "The target GPU has no active display connector, so Linux appears to be displaying through another GPU", "Use Looking Glass, RDP, Parsec/Sunshine, or a dGPU-wired external port to view the Windows VM");
+        }
+
+        if (r.compatibility.laptopTargetDrivesDisplay && !cfg.thermalGuardEnabled) {
+            addFinding(DiagnosticSeverity::Blocker, "laptop-thermal-guard-required", "Laptop display-owner mode requires the thermal guard", "Thermal guard is disabled while the laptop display path may be lost", "Enable the GPU temperature guard before using this laptop mode");
+        }
+        if (r.compatibility.laptopTargetDrivesDisplay && cfg.safetyAutoRecoveryMinutes <= 0) {
+            addFinding(DiagnosticSeverity::Blocker, "laptop-auto-recovery-required", "Laptop display-owner mode requires auto recovery", "The VM-stop safety recovery timer is disabled", "Set VM-stop safety recovery to a positive value before using this laptop mode");
+        }
+        if (r.compatibility.laptopTargetDrivesDisplay && cfg.thermalGuardEnabled && !r.compatibility.gpuTemperatureReadable) {
+            addFinding(DiagnosticSeverity::Warning, "laptop-temperature-unreadable", "Laptop GPU temperature is unreadable", "No hwmon GPU temperature sensor is available before passthrough", "Verify fan control inside the Windows guest and keep the auto-recovery timer enabled");
+        }
     }
     if (!r.compatibility.vmXmlMatches) {
         addFinding(DiagnosticSeverity::Blocker, "xml-mismatch", "Libvirt XML does not match the app configuration", "The configured hostdev PCI functions are not found in the inactive domain XML", "Back up and update the domain XML or reconfigure the GPU/audio PCI addresses");
@@ -1057,6 +1263,17 @@ QVariantMap systemInventoryToMap() {
     inv["vmStoppedAwaitingDecision"] = cfg.vmStoppedAwaitingDecision;
     inv["lastStoppedVm"] = cfg.lastStoppedVm;
     inv["lastStoppedAt"] = cfg.lastStoppedAt;
+    const LaptopSafetyInfo laptop = inspectLaptopSafety(cfg.gpuBdf);
+    inv["likelyLaptop"] = laptop.likelyLaptop;
+    inv["laptopChassisType"] = laptop.chassisType;
+    inv["laptopSafetySummary"] = laptop.summary;
+    inv["laptopTargetDrmCards"] = laptop.targetDrmCards;
+    inv["laptopActiveConnectors"] = laptop.activeConnectors;
+    inv["laptopInternalConnectors"] = laptop.internalConnectors;
+    inv["laptopExternalConnectors"] = laptop.externalConnectors;
+    inv["laptopTargetDrivesDisplay"] = laptop.targetDrivesActiveDisplay;
+    inv["laptopTargetDrivesInternalPanel"] = laptop.targetDrivesInternalPanel;
+    inv["laptopHybridCandidate"] = laptop.targetAppearsSafeHybridOffload;
     QVariantList devices;
     for (const auto &bdf : allGraphicsControllers(nullptr)) {
         const DeviceInfo d = inspectDevice(bdf);
@@ -1085,6 +1302,12 @@ QString renderInventoryText(const QVariantMap &inventory) {
     ts << "IOMMU groups: " << (inventory.value("iommuEnabled").toBool() ? "present" : "missing") << "\n";
     ts << "Libvirt hook: " << (inventory.value("hookInstalled").toBool() ? "installed" : "missing") << "\n";
     ts << "Fallback display: " << (inventory.value("fallbackDisplay").toBool() ? "available" : "not confirmed") << "\n";
+    ts << "Laptop detected: " << (inventory.value("likelyLaptop").toBool() ? "yes" : "no") << "\n";
+    if (inventory.value("likelyLaptop").toBool()) {
+        ts << "Laptop safety: " << inventory.value("laptopSafetySummary").toString() << "\n";
+        ts << "Target drives active display: " << (inventory.value("laptopTargetDrivesDisplay").toBool() ? "yes" : "no") << "\n";
+        ts << "Target drives internal panel: " << (inventory.value("laptopTargetDrivesInternalPanel").toBool() ? "yes" : "no") << "\n";
+    }
     ts << "Current mode: " << inventory.value("currentMode").toString() << "\n";
     ts << "Preferred boot: " << inventory.value("preferredBoot").toString() << "\n";
     ts << "Next boot target: " << (inventory.value("nextBootMode").toString().isEmpty() ? "(none)" : inventory.value("nextBootMode").toString()) << "\n";
@@ -1134,7 +1357,16 @@ QString renderPreflightText(const PreflightReport &r) {
     ts << "Libvirt hook: " << (r.compatibility.hookInstalled ? "installed" : "missing") << "\n";
     ts << "Fallback display/SSH: " << (r.compatibility.hasFallbackDisplay || r.compatibility.sshdActive ? "yes" : "no") << "\n";
     ts << "Secure Boot: " << (r.compatibility.secureBootEnabled ? "enabled" : "disabled/unknown") << "\n";
-    ts << "NVIDIA hidden-state: " << (r.compatibility.nvidiaHiddenState ? "present" : "not detected") << "\n\n";
+    ts << "NVIDIA hidden-state: " << (r.compatibility.nvidiaHiddenState ? "present" : "not detected") << "\n";
+    ts << "Laptop detected: " << (r.compatibility.likelyLaptop ? "yes" : "no") << "\n";
+    if (r.compatibility.likelyLaptop) {
+        ts << "Laptop safety: " << r.compatibility.laptopSafetySummary << "\n";
+        ts << "Target DRM cards: " << (r.compatibility.laptopTargetDrmCards.isEmpty() ? "(none)" : r.compatibility.laptopTargetDrmCards.join(", ")) << "\n";
+        ts << "Target active connectors: " << (r.compatibility.laptopActiveConnectors.isEmpty() ? "(none)" : r.compatibility.laptopActiveConnectors.join(", ")) << "\n";
+        ts << "Target internal panel: " << (r.compatibility.laptopTargetDrivesInternalPanel ? "yes" : "no") << "\n";
+        ts << "Hybrid/offload candidate: " << (r.compatibility.laptopTargetAppearsSafeHybridOffload ? "yes" : "no") << "\n";
+    }
+    ts << "\n";
     if (!r.blockers.isEmpty()) {
         ts << "Blockers:\n";
         for (const auto &b : r.blockers) ts << " - " << b << "\n";
@@ -1174,7 +1406,21 @@ QString renderPreflightText(const QVariantMap &preflight) {
     ts << "Libvirt hook: " << (comp.value("hookInstalled").toBool() ? "installed" : "missing") << "\n";
     ts << "Fallback display/SSH: " << ((comp.value("hasFallbackDisplay").toBool() || comp.value("sshdActive").toBool()) ? "yes" : "no") << "\n";
     ts << "Secure Boot: " << (comp.value("secureBootEnabled").toBool() ? "enabled" : "disabled/unknown") << "\n";
-    ts << "NVIDIA hidden-state: " << (comp.value("nvidiaHiddenState").toBool() ? "present" : "not detected") << "\n\n";
+    ts << "NVIDIA hidden-state: " << (comp.value("nvidiaHiddenState").toBool() ? "present" : "not detected") << "\n";
+    ts << "Laptop detected: " << (comp.value("likelyLaptop").toBool() ? "yes" : "no") << "\n";
+    if (comp.value("likelyLaptop").toBool()) {
+        ts << "Laptop safety: " << comp.value("laptopSafetySummary").toString() << "\n";
+        auto listToText = [](const QVariantList &items) {
+            QStringList out;
+            for (const auto &v : items) out << v.toString();
+            return out.isEmpty() ? QString("(none)") : out.join(", ");
+        };
+        ts << "Target DRM cards: " << listToText(comp.value("laptopTargetDrmCards").toList()) << "\n";
+        ts << "Target active connectors: " << listToText(comp.value("laptopActiveConnectors").toList()) << "\n";
+        ts << "Target internal panel: " << (comp.value("laptopTargetDrivesInternalPanel").toBool() ? "yes" : "no") << "\n";
+        ts << "Hybrid/offload candidate: " << (comp.value("laptopTargetAppearsSafeHybridOffload").toBool() ? "yes" : "no") << "\n";
+    }
+    ts << "\n";
     const auto blockers = preflight.value("blockers").toList();
     const auto warnings = preflight.value("warnings").toList();
     const auto notes = preflight.value("notes").toList();

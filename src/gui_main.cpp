@@ -114,10 +114,11 @@ public:
         auto *buttons = new QHBoxLayout();
         probeBtn = new QPushButton("Probe");
         saveBtn = new QPushButton("Save");
-        autoSetupBtn = new QPushButton("Auto setup single GPU");
+        autoSetupBtn = new QPushButton("Auto setup GPU");
         hookBtn = new QPushButton("Install hook");
         inventoryBtn = new QPushButton("Inventory");
         diagnoseBtn = new QPushButton("Preflight");
+        laptopCheckBtn = new QPushButton("Laptop check");
         simulateBtn = new QPushButton("Simulate VM");
         vmBtn = new QPushButton("Reboot to VM");
         hostBtn = new QPushButton("Reboot to Host");
@@ -128,6 +129,7 @@ public:
         buttons->addWidget(hookBtn);
         buttons->addWidget(inventoryBtn);
         buttons->addWidget(diagnoseBtn);
+        buttons->addWidget(laptopCheckBtn);
         buttons->addWidget(simulateBtn);
         buttons->addWidget(vmBtn);
         buttons->addWidget(hostBtn);
@@ -163,6 +165,7 @@ public:
         connect(hookBtn, &QPushButton::clicked, this, &MainWindow::onInstallHook);
         connect(inventoryBtn, &QPushButton::clicked, this, &MainWindow::onInventory);
         connect(diagnoseBtn, &QPushButton::clicked, this, &MainWindow::onDiagnose);
+        connect(laptopCheckBtn, &QPushButton::clicked, this, &MainWindow::onLaptopCheck);
         connect(simulateBtn, &QPushButton::clicked, this, &MainWindow::onSimulateVm);
         connect(vmBtn, &QPushButton::clicked, this, &MainWindow::onSwitchToVm);
         connect(hostBtn, &QPushButton::clicked, this, &MainWindow::onSwitchToHost);
@@ -221,8 +224,8 @@ private slots:
     void onAutoSetupSingleGpu() {
         const auto answer = QMessageBox::warning(
             this,
-            "Auto setup single GPU",
-            "This will save the current VM/GPU fields, enable single-GPU acknowledgement, install the libvirt hook, and add missing GPU/audio PCI hostdev entries to the VM XML after making a backup. Continue?",
+            "Auto setup GPU passthrough",
+            "This will save the current VM/GPU fields, run laptop/display safety detection, install the libvirt hook, and add missing GPU/audio PCI hostdev entries to the VM XML after making a backup. On laptops, display-owner mode is blocked unless single-GPU acknowledgement and recovery are confirmed. Continue?",
             QMessageBox::Yes | QMessageBox::No,
             QMessageBox::No);
         if (answer != QMessageBox::Yes) return;
@@ -233,7 +236,14 @@ private slots:
             {"vmName", vmName->text().trimmed()},
             {"vmUuid", vmUuid->text().trimmed()},
             {"gpuBdf", gpuBdf->text().trimmed()},
-            {"audioBdf", audioBdf->text().trimmed()}
+            {"audioBdf", audioBdf->text().trimmed()},
+            {"useVendorReset", vendorReset->isChecked()},
+            {"hasFallbackDisplay", fallbackDisplay->isChecked()},
+            {"allowSingleGpu", allowSingleGpu->isChecked()},
+            {"autoStartVmOnBoot", autoStartVm->isChecked()},
+            {"thermalGuardEnabled", thermalGuard->isChecked()},
+            {"maxGpuTempC", maxGpuTemp->value()},
+            {"safetyAutoRecoveryMinutes", safetyRecoveryMinutes->value()}
         };
         auto resp = callHelper(req, &err);
         if (!err.isEmpty()) {
@@ -277,6 +287,19 @@ private slots:
             appendLog("Diagnostics failed: " + err);
             return;
         }
+        appendLog(renderPreflightText(resp.value("diagnostic").toObject().toVariantMap()));
+    }
+
+    void onLaptopCheck() {
+        QString err;
+        QJsonObject req{{"cmd", "laptopCheck"}};
+        if (!gpuBdf->text().trimmed().isEmpty()) req["gpuBdf"] = gpuBdf->text().trimmed();
+        auto resp = callHelper(req, &err);
+        if (!err.isEmpty()) {
+            appendLog("Laptop check failed: " + err);
+            return;
+        }
+        appendLog("Laptop compatibility check:\n" + QString::fromUtf8(QJsonDocument(resp).toJson(QJsonDocument::Indented)));
         appendLog(renderPreflightText(resp.value("diagnostic").toObject().toVariantMap()));
     }
 
@@ -404,6 +427,9 @@ private:
         const auto comp = preflight.value("compatibility").toMap();
         text += " | IOMMU: " + QString(comp.value("iommuEnabled").toBool() ? "enabled" : "missing");
         text += " | GPU temp: " + QString(comp.value("gpuTemperatureReadable").toBool() ? QString::number(comp.value("gpuTemperatureC").toInt()) + " °C" : "unreadable");
+        if (comp.value("likelyLaptop").toBool()) {
+            text += " | Laptop: " + comp.value("laptopSafetySummary").toString();
+        }
         const auto nextBoot = inventory.value("nextBootMode").toString();
         if (!nextBoot.isEmpty()) text += " | Next boot: " + nextBoot;
         if (inventory.value("vmStoppedAwaitingDecision").toBool()) text += " | VM stopped: decision needed";
@@ -505,6 +531,7 @@ private:
     QPushButton *hookBtn{};
     QPushButton *inventoryBtn{};
     QPushButton *diagnoseBtn{};
+    QPushButton *laptopCheckBtn{};
     QPushButton *simulateBtn{};
     QPushButton *vmBtn{};
     QPushButton *hostBtn{};

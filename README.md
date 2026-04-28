@@ -2,7 +2,7 @@
 
 GPU Switcher is a C++20 / Qt6 Linux GUI, CLI, and root helper daemon for controlled GPU ownership switching between a Linux host and a Windows virtual machine that uses VFIO PCI passthrough.
 
-The project now focuses on the common **single-GPU passthrough** workflow: the Linux host can reboot into a VM mode, bind the only GPU to `vfio-pci`, auto-start the configured libvirt VM, then record the VM stop event, schedule a fail-safe host recovery path, and let the user decide what happens next.
+The project focuses on controlled VFIO GPU ownership switching for desktops and supported laptops. The Linux host can reboot into VM mode, bind the configured GPU to `vfio-pci`, auto-start the configured libvirt VM, record the VM stop event, schedule a fail-safe host recovery path, and let the user decide what happens next.
 
 ## What this app automates
 
@@ -28,28 +28,28 @@ GPU Switcher turns those steps into GUI and CLI actions.
 
 Open the GUI and fill in at least the **VM name** or **VM UUID**.
 
-Then press **Auto setup single GPU**.
+Then press **Auto setup GPU**.
 
 The helper will:
 
-1. detect the only graphics controller automatically, or use the GPU PCI BDF you entered;
+1. detect the best passthrough GPU automatically when possible, preferring a non-Intel dGPU that is not driving a laptop display;
 2. detect the HDMI/DP audio companion function from the same IOMMU group when possible;
-3. save the config in `/var/lib/gpu-switcher/config.ini`;
-4. enable the explicit single-GPU acknowledgement;
+3. run laptop/display-topology detection using DMI, battery presence, DRM/KMS cards, and active connectors;
+4. save the config in `/var/lib/gpu-switcher/config.ini`;
 5. enable VM auto-start after reboot into VM mode;
 6. install `/etc/libvirt/hooks/qemu`;
 7. back up the inactive libvirt XML to `/var/lib/gpu-switcher/backups/`;
 8. add missing GPU/audio PCI hostdev entries to the VM XML;
-9. enable the default GPU temperature guard at 85 °C;
-10. enable the default VM-stop safety recovery timer at 10 minutes;
-11. re-run the preflight report.
+9. enable the default GPU temperature guard at 85 °C if it was disabled;
+10. enable the default VM-stop safety recovery timer at 10 minutes if it was disabled;
+11. re-run the preflight report and block unsafe laptop/display-owner modes.
 
 CLI equivalent:
 
 ```bash
-gsc autoSetupSingleGpu
+gpu-switcher-ctl autoSetupSingleGpu
 # or, when more than one GPU exists:
-gsc autoSetupSingleGpu 0000:01:00.0
+gpu-switcher-ctl autoSetupSingleGpu 0000:01:00.0
 ```
 
 ### 2. Linux host → Windows VM
@@ -58,7 +58,7 @@ From the GUI, press **Reboot to VM**.
 
 The helper will:
 
-1. validate IOMMU, IOMMU group safety, VM XML, hook installation, fallback display / SSH acknowledgement, GPU presence, and the temperature guard;
+1. validate IOMMU, IOMMU group safety, VM XML, hook installation, laptop display topology, fallback display / SSH acknowledgement, GPU presence, and the temperature guard;
 2. store the original Linux GPU/audio drivers;
 3. schedule `nextBootMode=vm` in `/var/lib/gpu-switcher/config.ini`;
 4. reboot the PC;
@@ -73,7 +73,7 @@ The helper will:
 The libvirt QEMU hook calls:
 
 ```bash
-gsc on-vm-stopped <domain>
+gpu-switcher-ctl on-vm-stopped <domain>
 ```
 
 The helper does not try an unsafe live handoff back to Linux. It records the stopped-VM decision, schedules Host recovery for the next restart, and arms the safety timer:
@@ -89,11 +89,11 @@ The GUI/CLI then gives three choices:
 
 | GUI option | CLI command | What it does |
 |---|---|---|
-| **Restart now to Host** | `gsc restartHostNow` | Schedules `nextBootMode=host` and immediately reboots. On the next boot, the GPU is rebound to the original Linux driver. |
-| **Return on next restart** | `gsc returnHostNextRestart` | Keeps `nextBootMode=host` but does **not** reboot now. The GPU returns to Linux whenever the user restarts later. |
-| **Keep GPU with VM** | `gsc keepGpuForVm` | Clears the stopped-VM warning, cancels the safety timer, and keeps the GPU assigned to VM/VFIO mode until the user manually chooses **Reboot to Host**. |
+| **Restart now to Host** | `gpu-switcher-ctl restartHostNow` | Schedules `nextBootMode=host` and immediately reboots. On the next boot, the GPU is rebound to the original Linux driver. |
+| **Return on next restart** | `gpu-switcher-ctl returnHostNextRestart` | Keeps `nextBootMode=host` but does **not** reboot now. The GPU returns to Linux whenever the user restarts later. |
+| **Keep GPU with VM** | `gpu-switcher-ctl keepGpuForVm` | Clears the stopped-VM warning, cancels the safety timer, and keeps the GPU assigned to VM/VFIO mode until the user manually chooses **Reboot to Host**. |
 
-If no user action is taken and `safetyAutoRecoveryMinutes` is greater than zero, the transient systemd timer calls `gsc safetyRecoverHostNow` and reboots back to Host mode. On a real single-GPU system, the local Linux GUI may not be visible after the VM closes because the GPU is still assigned to VFIO. Keep SSH, another remote path, or a known reboot shortcut available.
+If no user action is taken and `safetyAutoRecoveryMinutes` is greater than zero, the transient systemd timer calls `gpu-switcher-ctl safetyRecoverHostNow` and reboots back to Host mode. On a real single-GPU system, the local Linux GUI may not be visible after the VM closes because the GPU is still assigned to VFIO. Keep SSH, another remote path, or a known reboot shortcut available.
 
 ### 4. Windows VM / VFIO → Linux host
 
@@ -116,7 +116,10 @@ GPU passthrough can leave a machine without local display output. GPU Switcher i
 
 - refuses VM mode when IOMMU groups are missing;
 - refuses VM mode when the GPU shares an unsafe IOMMU group with unrelated hardware;
-- refuses single-GPU passthrough unless fallback display / SSH recovery is acknowledged or explicit single-GPU mode is enabled;
+- refuses single-GPU/display-owner passthrough unless fallback display / SSH recovery is acknowledged or explicit single-GPU mode is enabled;
+- detects laptops using DMI chassis type and battery presence, then checks the target GPU's DRM/KMS card and active connectors before allowing VM mode;
+- blocks laptop modes where the target GPU owns the internal panel unless explicit single-GPU acknowledgement plus a recovery path are configured;
+- does not treat “two GPUs detected” as safe on laptops unless the target GPU is not driving an active display connector;
 - validates the inactive libvirt domain XML before scheduling VM mode;
 - backs up the inactive VM XML before auto-patching or VM-mode handoff;
 - tracks original Linux drivers before binding to `vfio-pci`;
@@ -138,6 +141,33 @@ The app does **not** overclock, undervolt, change GPU power limits, flash firmwa
 - GPU HDMI/DP audio companion functions
 - Multi-GPU systems
 - Single-GPU systems with explicit recovery acknowledgement
+
+## Laptop support and blocking behavior
+
+Laptop support is intentionally conservative. The app now treats laptops by display topology, not by GPU count.
+
+Allowed or likely-safe paths:
+
+- **Hybrid/Optimus-style laptop:** Linux display is on the iGPU and the target dGPU has no active DRM connector. The app accepts this as a hybrid/offload candidate. Use Looking Glass, RDP, Parsec/Sunshine, or a dGPU-wired external port to see the Windows VM.
+- **eGPU or external dGPU path:** Linux keeps another display path while the passed-through GPU goes to the VM.
+- **Explicit single-GPU laptop mode:** possible only when the user enables the single-GPU acknowledgement and confirms SSH/fallback recovery, with thermal guard and VM-stop auto recovery enabled.
+
+Blocked paths:
+
+- laptop detected but the target GPU cannot be mapped to a DRM/KMS card in host mode;
+- target GPU drives the laptop internal panel and single-GPU acknowledgement is not enabled;
+- target GPU drives the laptop internal panel or another active output and no SSH/fallback display is active or confirmed;
+- laptop display-owner mode with thermal guard disabled;
+- laptop display-owner mode with VM-stop auto recovery disabled.
+
+Useful checks:
+
+```bash
+gpu-switcher-ctl laptopCheck [gpuBdf]
+gpu-switcher-ctl diagnose [gpuBdf]
+```
+
+The GUI also has a **Laptop check** button that prints the same topology and preflight result.
 
 ## Project layout
 
@@ -178,8 +208,7 @@ cmake --build build -j
 ```bash
 sudo install -m 0755 build/gpu-switcher-helperd /usr/local/bin/
 sudo install -m 0755 build/gpu-switcher-gui /usr/local/bin/
-sudo install -m 0755 build/gsc /usr/local/bin/
-sudo install -m 0755 build/gpu-switcher-ctl /usr/local/bin/   # optional legacy CLI name
+sudo install -m 0755 build/gpu-switcher-ctl /usr/local/bin/
 sudo install -m 0644 systemd/gpu-switcher-helperd.service /etc/systemd/system/
 sudo install -m 0644 systemd/gpu-switcher-boot.service /etc/systemd/system/
 sudo install -m 0755 hooks/qemu /etc/libvirt/hooks/qemu
@@ -190,21 +219,20 @@ sudo systemctl enable --now gpu-switcher-helperd.service gpu-switcher-boot.servi
 ## CLI commands
 
 ```bash
-gsc status
-gsc inventory
-gsc diagnose [gpuBdf]
-gsc autoSetupSingleGpu [gpuBdf]
-gsc simulateVm [gpuBdf]
-gsc rebootToVm
-gsc rebootToHost
-gsc restartHostNow
-gsc returnHostNextRestart
-gsc keepGpuForVm
-gsc safetyRecoverHostNow
-gsc on-vm-stopped <domain>
+gpu-switcher-ctl status
+gpu-switcher-ctl inventory
+gpu-switcher-ctl diagnose [gpuBdf]
+gpu-switcher-ctl laptopCheck [gpuBdf]
+gpu-switcher-ctl autoSetupSingleGpu [gpuBdf]
+gpu-switcher-ctl simulateVm [gpuBdf]
+gpu-switcher-ctl rebootToVm
+gpu-switcher-ctl rebootToHost
+gpu-switcher-ctl restartHostNow
+gpu-switcher-ctl returnHostNextRestart
+gpu-switcher-ctl keepGpuForVm
+gpu-switcher-ctl safetyRecoverHostNow
+gpu-switcher-ctl on-vm-stopped <domain>
 ```
-
-`gsc` is the preferred CLI name. `gpu-switcher-ctl` is still built and installable as a compatibility command for older scripts. When run as `sudo gsc ...`, the CLI can auto-start `gpu-switcher-helperd` if the systemd service is not already listening.
 
 ### Important commands
 
@@ -212,7 +240,8 @@ gsc on-vm-stopped <domain>
 |---|---|
 | `inventory` | Prints GPU, IOMMU, Secure Boot, SSH, hook, current mode, and next boot target information. |
 | `diagnose` | Runs the preflight report used by the GUI. |
-| `autoSetupSingleGpu` | Detects GPU/audio, saves config, installs hook, backs up XML, and adds missing hostdev entries. |
+| `laptopCheck` | Reports laptop/display topology and whether the target GPU appears to drive the internal panel or active outputs. |
+| `autoSetupSingleGpu` | Detects GPU/audio, runs laptop safety checks, saves config, installs hook, backs up XML, and adds missing hostdev entries. |
 | `simulateVm` | Dry-runs the host→VM flow without touching hardware. |
 | `rebootToVm` | Schedules VM mode and reboots. |
 | `rebootToHost` | Schedules host mode and reboots. |

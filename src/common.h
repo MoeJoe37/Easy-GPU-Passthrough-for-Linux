@@ -60,6 +60,26 @@ struct DeviceInfo {
     QString temperaturePath;
 };
 
+struct LaptopSafetyInfo {
+    bool chassisLooksPortable = false;
+    bool batteryPresent = false;
+    bool likelyLaptop = false;
+    bool targetHasDrmCard = false;
+    bool targetDrivesActiveDisplay = false;
+    bool targetDrivesInternalPanel = false;
+    bool targetHasExternalConnectedDisplay = false;
+    bool targetIsOnlyGraphicsController = false;
+    bool targetAppearsSafeHybridOffload = false;
+    QString chassisType;
+    QStringList targetDrmCards;
+    QStringList activeConnectors;
+    QStringList internalConnectors;
+    QStringList externalConnectors;
+    QString summary;
+    QStringList blockers;
+    QStringList warnings;
+};
+
 struct CompatibilityReport {
     bool iommuEnabled = false;
     bool gpuExists = false;
@@ -75,6 +95,20 @@ struct CompatibilityReport {
     bool sshdActive = false;
     bool nvidiaHiddenState = false;
     bool gpuHasAudioCompanion = false;
+    bool likelyLaptop = false;
+    bool laptopTargetHasDrmCard = false;
+    bool laptopTargetDrivesDisplay = false;
+    bool laptopTargetDrivesInternalPanel = false;
+    bool laptopTargetHasExternalConnectedDisplay = false;
+    bool laptopTargetAppearsSafeHybridOffload = false;
+    QString laptopChassisType;
+    QString laptopSafetySummary;
+    QStringList laptopTargetDrmCards;
+    QStringList laptopActiveConnectors;
+    QStringList laptopInternalConnectors;
+    QStringList laptopExternalConnectors;
+    QStringList laptopBlockers;
+    QStringList laptopWarnings;
     bool gpuTemperatureReadable = false;
     int gpuTemperatureC = -1;
     int maxGpuTempC = 85;
@@ -139,6 +173,7 @@ bool iommuEnabled(QString *detail = nullptr);
 QStringList allGraphicsControllers(QString *detail = nullptr);
 bool systemHasFallbackDisplay(QString *detail = nullptr);
 bool singleGPUOnly(QString gpuBdf, QString *detail = nullptr);
+LaptopSafetyInfo inspectLaptopSafety(const QString &targetGpuBdf);
 QStringList devicesInIommuGroup(QString groupName, QString *detail = nullptr);
 bool iommuGroupIsSafe(const QString &gpuBdf, QStringList *reasons = nullptr);
 QString kernelCmdline(QString *detail = nullptr);

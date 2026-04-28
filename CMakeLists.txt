@@ -29,10 +29,3 @@ add_executable(gpu-switcher-ctl
     src/ctl_main.cpp
 )
 target_link_libraries(gpu-switcher-ctl PRIVATE gpu_switcher_common Qt6::Core Qt6::Network)
-
-# Short CLI name. The legacy gpu-switcher-ctl target is kept so older hooks,
-# scripts, and documentation continue to work.
-add_executable(gsc
-    src/ctl_main.cpp
-)
-target_link_libraries(gsc PRIVATE gpu_switcher_common Qt6::Core Qt6::Network)

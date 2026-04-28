@@ -62,17 +62,6 @@ static void runBestEffort(const QString &program, const QStringList &args, QStri
 }
 
 
-static QString ctlCommandPath() {
-    const QFileInfo primary(ctlBinaryPath());
-    if (primary.isExecutable()) return primary.absoluteFilePath();
-
-    const QString legacy = "/usr/local/bin/gpu-switcher-ctl";
-    const QFileInfo legacyInfo(legacy);
-    if (legacyInfo.isExecutable()) return legacyInfo.absoluteFilePath();
-
-    return ctlBinaryPath();
-}
-
 static void cancelSafetyRecovery(QStringList *notes) {
     runBestEffort("systemctl", {"stop", "gpu-switcher-safety-recover.timer", "gpu-switcher-safety-recover.service"}, notes, 5000);
     runBestEffort("systemctl", {"reset-failed", "gpu-switcher-safety-recover.timer", "gpu-switcher-safety-recover.service"}, notes, 5000);
@@ -91,7 +80,7 @@ static void scheduleSafetyRecoveryTimer(const AppConfig &cfg, QStringList *notes
                   {"--unit=gpu-switcher-safety-recover",
                    "--collect",
                    "--on-active=" + delay,
-                   ctlCommandPath(),
+                   "/usr/local/bin/gpu-switcher-ctl",
                    "safetyRecoverHostNow"},
                   notes,
                   10000);
@@ -270,6 +259,37 @@ static bool ensureDomainHasHostdevs(const AppConfig &cfg, QStringList *notes, QS
     return true;
 }
 
+static QString chooseBestPassthroughGpu(QStringList *notes) {
+    const QStringList gfx = allGraphicsControllers(nullptr);
+    if (gfx.isEmpty()) return {};
+    if (gfx.size() == 1) return normalizeBdf(gfx.first());
+
+    QString firstDiscrete;
+    QString firstHybridSafe;
+    for (const auto &raw : gfx) {
+        const QString bdf = normalizeBdf(raw);
+        const DeviceInfo d = inspectDevice(bdf);
+        const VendorKind kind = vendorKind(d);
+        if (kind == VendorKind::Intel) continue;
+        if (firstDiscrete.isEmpty()) firstDiscrete = bdf;
+        const LaptopSafetyInfo laptop = inspectLaptopSafety(bdf);
+        if (laptop.likelyLaptop && laptop.targetAppearsSafeHybridOffload) {
+            firstHybridSafe = bdf;
+            break;
+        }
+    }
+
+    if (!firstHybridSafe.isEmpty()) {
+        if (notes) notes->push_back("Auto-selected hybrid/offload dGPU " + firstHybridSafe);
+        return firstHybridSafe;
+    }
+    if (!firstDiscrete.isEmpty()) {
+        if (notes) notes->push_back("Auto-selected non-Intel GPU " + firstDiscrete);
+        return firstDiscrete;
+    }
+    return {};
+}
+
 static bool autoConfigureSingleGpu(AppConfig cfg, const QJsonObject &req, QJsonObject *payload, QString *error) {
     QStringList notes;
 
@@ -278,15 +298,21 @@ static bool autoConfigureSingleGpu(AppConfig cfg, const QJsonObject &req, QJsonO
     if (!reqVmName.isEmpty()) cfg.vmName = reqVmName;
     if (!reqVmUuid.isEmpty()) cfg.vmUuid = reqVmUuid;
 
+    cfg.useVendorReset = req.value("useVendorReset").toBool(cfg.useVendorReset);
+    cfg.hasFallbackDisplay = req.value("hasFallbackDisplay").toBool(cfg.hasFallbackDisplay);
+    cfg.allowSingleGpu = req.value("allowSingleGpu").toBool(cfg.allowSingleGpu);
+    cfg.autoStartVmOnBoot = req.value("autoStartVmOnBoot").toBool(cfg.autoStartVmOnBoot);
+    cfg.thermalGuardEnabled = req.value("thermalGuardEnabled").toBool(cfg.thermalGuardEnabled);
+    cfg.maxGpuTempC = req.value("maxGpuTempC").toInt(cfg.maxGpuTempC);
+    cfg.safetyAutoRecoveryMinutes = req.value("safetyAutoRecoveryMinutes").toInt(cfg.safetyAutoRecoveryMinutes);
+
     QString selectedGpu = normalizeBdf(req.value("gpuBdf").toString());
     if (selectedGpu.isEmpty()) selectedGpu = normalizeBdf(cfg.gpuBdf);
+    if (selectedGpu.isEmpty()) selectedGpu = chooseBestPassthroughGpu(&notes);
     if (selectedGpu.isEmpty()) {
         const QStringList gfx = allGraphicsControllers(nullptr);
-        if (gfx.size() == 1) selectedGpu = normalizeBdf(gfx.first());
-        else {
-            if (error) *error = "Auto setup found " + QString::number(gfx.size()) + " graphics devices; select the GPU PCI BDF manually first";
-            return false;
-        }
+        if (error) *error = "Auto setup could not safely select a passthrough GPU from " + QString::number(gfx.size()) + " graphics devices; select the GPU PCI BDF manually first";
+        return false;
     }
 
     cfg.gpuBdf = selectedGpu;
@@ -303,14 +329,50 @@ static bool autoConfigureSingleGpu(AppConfig cfg, const QJsonObject &req, QJsonO
         return false;
     }
 
-    QString detail;
-    cfg.allowSingleGpu = true;
-    cfg.hasFallbackDisplay = cfg.hasFallbackDisplay || systemHasFallbackDisplay(&detail) || sshdActive(&detail);
+    const LaptopSafetyInfo laptop = inspectLaptopSafety(selectedGpu);
+    const bool isSingle = singleGPUOnly(selectedGpu, nullptr);
+    const bool laptopDisplayOwner = laptop.likelyLaptop && laptop.targetDrivesActiveDisplay;
+
+    if (cfg.safetyAutoRecoveryMinutes <= 0) {
+        cfg.safetyAutoRecoveryMinutes = 10;
+        notes << "Enabled VM-stop safety recovery timer at 10 minutes";
+    }
+    if (!cfg.thermalGuardEnabled) {
+        cfg.thermalGuardEnabled = true;
+        notes << "Enabled thermal guard during auto setup";
+    }
+
+    if (laptop.likelyLaptop) {
+        notes << "Laptop compatibility: " + laptop.summary;
+        if (!laptop.blockers.isEmpty()) notes << "Laptop topology blockers/warnings: " + laptop.blockers.join("; ");
+        if (!laptop.warnings.isEmpty()) notes << "Laptop topology warnings: " + laptop.warnings.join("; ");
+
+        if (!laptop.targetHasDrmCard) {
+            if (error) *error = "Laptop compatibility blocked: the target GPU could not be mapped to a DRM/KMS card, so the app cannot verify whether it drives the internal panel";
+            return false;
+        }
+        if (laptopDisplayOwner && !cfg.allowSingleGpu) {
+            if (error) *error = "Laptop compatibility blocked: the target GPU currently owns an active display connector. Enable the single-GPU acknowledgement and confirm SSH/fallback recovery before auto setup.";
+            return false;
+        }
+        if (laptopDisplayOwner && !cfg.hasFallbackDisplay && !sshdActive(nullptr)) {
+            if (error) *error = "Laptop compatibility blocked: the target GPU owns a display and no SSH/fallback display is active or confirmed.";
+            return false;
+        }
+        if (!laptopDisplayOwner && laptop.targetAppearsSafeHybridOffload) {
+            cfg.hasFallbackDisplay = true;
+            notes << "Hybrid laptop mode accepted: Linux appears to keep display ownership on another GPU";
+        }
+    } else if (isSingle) {
+        cfg.allowSingleGpu = true;
+        notes << "Desktop/single-GPU path accepted by auto setup";
+    }
+
     cfg.autoStartVmOnBoot = true;
     cfg.mode = cfg.mode.isEmpty() ? "host" : cfg.mode;
 
     if (!saveConfig(cfg, error)) return false;
-    notes << "Saved single-GPU config: GPU=" + cfg.gpuBdf + (cfg.audioBdf.isEmpty() ? QString() : " audio=" + cfg.audioBdf);
+    notes << "Saved passthrough config: GPU=" + cfg.gpuBdf + (cfg.audioBdf.isEmpty() ? QString() : " audio=" + cfg.audioBdf);
 
     if (!installHook(error)) return false;
     notes << "Installed libvirt QEMU lifecycle hook";
@@ -324,11 +386,17 @@ static bool autoConfigureSingleGpu(AppConfig cfg, const QJsonObject &req, QJsonO
     }
 
     const auto diag = buildPreflightReport(cfg);
+    if (!diag.canEnterVm) {
+        if (error) *error = "Auto setup completed file changes but final safety preflight still blocks VM mode: " + diag.blockers.join("; ");
+        return false;
+    }
+
     if (payload) {
         (*payload)["configured"] = true;
         (*payload)["config"] = QJsonObject{
             {"vmName", cfg.vmName}, {"vmUuid", cfg.vmUuid}, {"gpuBdf", cfg.gpuBdf}, {"audioBdf", cfg.audioBdf},
-            {"allowSingleGpu", cfg.allowSingleGpu}, {"hasFallbackDisplay", cfg.hasFallbackDisplay}, {"autoStartVmOnBoot", cfg.autoStartVmOnBoot}
+            {"allowSingleGpu", cfg.allowSingleGpu}, {"hasFallbackDisplay", cfg.hasFallbackDisplay}, {"autoStartVmOnBoot", cfg.autoStartVmOnBoot},
+            {"thermalGuardEnabled", cfg.thermalGuardEnabled}, {"safetyAutoRecoveryMinutes", cfg.safetyAutoRecoveryMinutes}
         };
         (*payload)["notes"] = QJsonArray::fromStringList(notes);
         (*payload)["diagnostic"] = QJsonObject::fromVariantMap(preflightToMap(diag));
@@ -363,6 +431,15 @@ static bool scheduleBootTransition(AppConfig cfg, const QString &target, QString
     if (normalized.isEmpty()) {
         if (error) *error = "Invalid boot target: " + target;
         return false;
+    }
+
+    if (normalized == "vm") {
+        const PreflightReport preflight = buildPreflightReport(cfg);
+        if (!preflight.canEnterVm) {
+            if (error) *error = "VM boot blocked by safety preflight: " + preflight.blockers.join("; ");
+            return false;
+        }
+        if (notes) notes->push_back("Safety preflight passed before scheduling VM boot");
     }
 
     cfg.nextBootMode = normalized;
@@ -478,9 +555,7 @@ SUBOP="${3:-}"
 # or keep-vfio from the GUI/CLI.
 case "${OP}:${SUBOP}" in
   stopped:end|release:end)
-    if [[ -x /usr/local/bin/gsc ]]; then
-      /usr/local/bin/gsc on-vm-stopped "${DOMAIN}" || true
-    elif [[ -x /usr/local/bin/gpu-switcher-ctl ]]; then
+    if [[ -x /usr/local/bin/gpu-switcher-ctl ]]; then
       /usr/local/bin/gpu-switcher-ctl on-vm-stopped "${DOMAIN}" || true
     fi
     ;;
@@ -1006,6 +1081,27 @@ private:
                 if (!bdf.isEmpty()) cfg.gpuBdf = bdf;
                 const auto diag = buildPreflightReport(cfg);
                 sendJson(sock, okReply({{"diagnostic", QJsonObject::fromVariantMap(preflightToMap(diag))}}));
+                continue;
+            }
+
+            if (cmd == "laptopCheck") {
+                AppConfig cfg = loadConfig();
+                const QString bdf = normalizeBdf(req.value("gpuBdf").toString());
+                if (!bdf.isEmpty()) cfg.gpuBdf = bdf;
+                const auto diag = buildPreflightReport(cfg);
+                const auto comp = diag.compatibility;
+                sendJson(sock, okReply({
+                    {"likelyLaptop", comp.likelyLaptop},
+                    {"summary", comp.laptopSafetySummary},
+                    {"targetDrmCards", QJsonArray::fromStringList(comp.laptopTargetDrmCards)},
+                    {"activeConnectors", QJsonArray::fromStringList(comp.laptopActiveConnectors)},
+                    {"internalConnectors", QJsonArray::fromStringList(comp.laptopInternalConnectors)},
+                    {"externalConnectors", QJsonArray::fromStringList(comp.laptopExternalConnectors)},
+                    {"targetDrivesDisplay", comp.laptopTargetDrivesDisplay},
+                    {"targetDrivesInternalPanel", comp.laptopTargetDrivesInternalPanel},
+                    {"hybridOffloadCandidate", comp.laptopTargetAppearsSafeHybridOffload},
+                    {"diagnostic", QJsonObject::fromVariantMap(preflightToMap(diag))}
+                }));
                 continue;
             }
 

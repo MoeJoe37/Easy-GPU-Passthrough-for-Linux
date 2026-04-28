@@ -37,10 +37,7 @@ cmake --build build -j
 ```bash
 sudo install -m 0755 build/gpu-switcher-helperd /usr/local/bin/
 sudo install -m 0755 build/gpu-switcher-gui /usr/local/bin/
-sudo install -m 0755 build/gsc /usr/local/bin/
-sudo install -m 0755 build/gpu-switcher-ctl /usr/local/bin/   # optional legacy CLI name
-
-# `gsc` is the preferred CLI command. `gpu-switcher-ctl` is kept for compatibility.
+sudo install -m 0755 build/gpu-switcher-ctl /usr/local/bin/
 
 sudo install -m 0644 systemd/gpu-switcher-helperd.service /etc/systemd/system/
 sudo install -m 0644 systemd/gpu-switcher-boot.service /etc/systemd/system/
@@ -65,34 +62,45 @@ gpu-switcher-gui
 For single-GPU hosts:
 
 1. enter the VM name or UUID;
-2. press **Auto setup single GPU**;
+2. press **Auto setup GPU**;
 3. run **Preflight**;
 4. press **Reboot to VM** only when the report is acceptable.
 
 CLI equivalent:
 
 ```bash
-gsc autoSetupSingleGpu
-gsc diagnose
-gsc rebootToVm
+gpu-switcher-ctl autoSetupSingleGpu
+gpu-switcher-ctl laptopCheck
+gpu-switcher-ctl diagnose
+gpu-switcher-ctl rebootToVm
 ```
 
 ## Recovery commands
 
 ```bash
-gsc restartHostNow
-gsc returnHostNextRestart
-gsc keepGpuForVm
-gsc safetyRecoverHostNow
-gsc rebootToHost
+gpu-switcher-ctl restartHostNow
+gpu-switcher-ctl returnHostNextRestart
+gpu-switcher-ctl keepGpuForVm
+gpu-switcher-ctl safetyRecoverHostNow
+gpu-switcher-ctl rebootToHost
 ```
 
 ## Safety defaults
 
-Auto setup enables these safety defaults:
+Version 2.5.0 enables these defaults during auto setup:
 
 - `thermalGuardEnabled=true`
 - `maxGpuTempC=85`
 - `safetyAutoRecoveryMinutes=10`
 
 The temperature guard reads Linux `hwmon/temp*_input` sensors for the selected GPU before VM handoff. If the VM stops and no user action is taken, the safety recovery timer reboots back to Host mode after the configured grace period.
+
+## Laptop validation
+
+Before using a laptop, run:
+
+```bash
+gpu-switcher-ctl laptopCheck [gpuBdf]
+```
+
+The app now blocks unsafe laptop paths when it cannot verify display ownership, when the target GPU owns the internal panel without explicit single-GPU acknowledgement, or when display-owner mode has no SSH/fallback recovery. Hybrid laptops where Linux display remains on the iGPU are the preferred laptop case.

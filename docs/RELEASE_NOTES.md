@@ -2,12 +2,22 @@
 
 ## 2.5.0
 
-### Changed
+### Laptop safety gate
 
-- Added the short `gsc` CLI binary while keeping `gpu-switcher-ctl` as a legacy-compatible target.
-- `sudo gsc ...` now auto-starts `gpu-switcher-helperd` when the helper socket is not already available.
-- Helper-generated libvirt hooks and safety timers now prefer `/usr/local/bin/gsc` and fall back to `/usr/local/bin/gpu-switcher-ctl` when needed.
-- Updated README and build documentation to use the shorter CLI command.
+- Added laptop/portable detection using DMI chassis type and battery presence.
+- Added DRM/KMS topology detection for the selected GPU. The app maps the target PCI device to `cardN`, checks active connectors, and distinguishes internal panel connectors such as eDP/LVDS/DSI from external outputs.
+- Added **Laptop check** to the GUI.
+- Added `gpu-switcher-ctl laptopCheck [gpuBdf]`.
+- Changed laptop fallback logic: two GPUs are no longer treated as safe by themselves. The target GPU must not own an active display connector, or the user must explicitly use single-GPU/display-owner mode with recovery enabled.
+- Auto setup now prefers a non-Intel hybrid/offload dGPU when multiple GPUs are present.
+- Auto setup blocks laptops where target display ownership cannot be verified.
+- Auto setup blocks laptop display-owner paths unless single-GPU acknowledgement and SSH/fallback recovery are confirmed.
+- VM boot scheduling now runs the same preflight gate before rebooting, so unsafe configurations are blocked before the machine restarts.
+- Laptop display-owner mode now requires thermal guard and a positive VM-stop auto-recovery timer.
+
+### Documentation
+
+- Updated README, build guide, and risk register with laptop modes, blocked paths, and recovery expectations.
 
 ## 2.4.0
 
@@ -22,9 +32,9 @@
 - Preflight warns when Linux cannot read a GPU temperature sensor, because VFIO/guest ownership can hide host-side thermal telemetry.
 - Preflight warns when the thermal guard or VM-stop safety timer is disabled.
 - When the VM stops, the app now schedules Host recovery for the next restart by default.
-- When the VM stops, the app arms a transient systemd timer that calls `gsc safetyRecoverHostNow` after the configured grace period.
+- When the VM stops, the app arms a transient systemd timer that calls `gpu-switcher-ctl safetyRecoverHostNow` after the configured grace period.
 - **Keep GPU with VM** now explicitly cancels the safety recovery timer and warns that this should only be used when guest/firmware cooling is confirmed.
-- Added CLI command `gsc safetyRecoverHostNow` for the transient safety timer.
+- Added CLI command `gpu-switcher-ctl safetyRecoverHostNow` for the transient safety timer.
 - Updated `docs/RISKS.md` with thermal/idle-VFIO risks and mitigations.
 
 ### Notes
@@ -37,7 +47,7 @@
 ### Added
 
 - Added **Auto setup single GPU** GUI action.
-- Added `gsc autoSetupSingleGpu [gpuBdf]`.
+- Added `gpu-switcher-ctl autoSetupSingleGpu [gpuBdf]`.
 - Auto-detects the only graphics controller when no GPU BDF is provided.
 - Auto-detects the HDMI/DP audio companion function from the same IOMMU group when possible.
 - Automatically enables the explicit single-GPU acknowledgement during auto setup.

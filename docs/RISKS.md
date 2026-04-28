@@ -1,6 +1,6 @@
 # GPU Switcher risk register
 
-This file tracks the failure modes that matter for single-GPU and multi-GPU VFIO passthrough. Version 2.4.0 adds thermal and idle-recovery guardrails on top of the existing IOMMU, libvirt, driver, and reboot-recovery checks.
+This file tracks the failure modes that matter for single-GPU and multi-GPU VFIO passthrough. Version 2.5.0 adds laptop display-topology guardrails on top of the existing IOMMU, libvirt, driver, and reboot-recovery checks.
 
 Important boundary: this app does not overclock, undervolt, change GPU power limits, flash firmware, or write fan curves. It only changes PCI driver ownership. It cannot guarantee that defective hardware, a blocked fan, bad airflow, a failing PSU, or a guest OS driver bug will be safe.
 
@@ -40,7 +40,7 @@ Important boundary: this app does not overclock, undervolt, change GPU power lim
 
 **Symptom:** The VM stopped, but the GPU is still assigned to VFIO/VM mode.
 
-**Status in app:** Mitigated. The hook records a stopped-VM decision, schedules Host recovery for the next restart by default, and arms a transient systemd safety timer. If the user does nothing, the timer calls `gsc safetyRecoverHostNow` and reboots back to Host mode.
+**Status in app:** Mitigated. The hook records a stopped-VM decision, schedules Host recovery for the next restart by default, and arms a transient systemd safety timer. If the user does nothing, the timer calls `gpu-switcher-ctl safetyRecoverHostNow` and reboots back to Host mode.
 
 **User fix:** Choose **Restart now to Host** for the safest path. Choose **Return on next restart** only if you intentionally want to delay the reboot. Choose **Keep GPU with VM** only when you have verified guest/firmware cooling and understand that this cancels the safety timer.
 
@@ -56,7 +56,7 @@ Important boundary: this app does not overclock, undervolt, change GPU power lim
 
 **Symptom:** VM mode is blocked because the configured GPU/audio BDFs are not present in the inactive VM XML.
 
-**Status in app:** Fixed by **Auto setup single GPU** when possible. The helper backs up the inactive domain XML and adds missing `<hostdev>` entries for the GPU and companion audio function.
+**Status in app:** Fixed by **Auto setup GPU** when possible. The helper backs up the inactive domain XML and adds missing `<hostdev>` entries for the GPU and companion audio function.
 
 **User fix:** If auto-patching fails, manually edit the VM XML or add the PCI host devices in virt-manager, then run **Preflight** again.
 
@@ -64,7 +64,7 @@ Important boundary: this app does not overclock, undervolt, change GPU power lim
 
 **Symptom:** VM shutdown does not create the stopped-VM decision state.
 
-**Status in app:** Partially fixed. **Auto setup single GPU** installs `/etc/libvirt/hooks/qemu`, makes it executable, and the hook handles both `stopped:end` and `release:end` events.
+**Status in app:** Partially fixed. **Auto setup GPU** installs `/etc/libvirt/hooks/qemu`, makes it executable, and the hook handles both `stopped:end` and `release:end` events.
 
 **User fix:** Confirm the hook is installed at `/etc/libvirt/hooks/qemu`, executable, and that the libvirt daemon used by the VM supports QEMU hooks. Restart libvirt after installing the hook when needed.
 
@@ -74,7 +74,7 @@ Important boundary: this app does not overclock, undervolt, change GPU power lim
 
 **Status in app:** Mitigated. The helper records the original GPU/audio drivers, clears `driver_override`, reloads common driver modules, tries direct bind, then remove/rescan fallback.
 
-**User fix:** Use **Restart now to Host** or `gsc rebootToHost`. If the card is still wedged, power-cycle the PC.
+**User fix:** Use **Restart now to Host** or `gpu-switcher-ctl rebootToHost`. If the card is still wedged, power-cycle the PC.
 
 ## 10) Boot service does not run early enough
 
@@ -100,13 +100,13 @@ If the distro uses a nonstandard display manager unit, add equivalent ordering o
 
 ```bash
 # Reboot immediately and restore GPU ownership to Linux
-gsc restartHostNow
+gpu-switcher-ctl restartHostNow
 
 # Restore GPU ownership to Linux on the next restart
-gsc returnHostNextRestart
+gpu-switcher-ctl returnHostNextRestart
 
 # Keep GPU ownership with VFIO/VM until changed later; cancels safety timer
-gsc keepGpuForVm
+gpu-switcher-ctl keepGpuForVm
 ```
 
 ## 12) User disables thermal guard or auto recovery
@@ -140,3 +140,27 @@ gsc keepGpuForVm
 **Status in app:** Not automated yet. GPU Switcher controls GPU ownership, not USB controller/input-device passthrough.
 
 **User fix:** Configure USB controller passthrough, USB device redirection, evdev input, Looking Glass/SPICE fallback, or a separate keyboard/mouse path before relying on single-GPU mode.
+
+## 16) Laptop target GPU owns the internal panel
+
+**Symptom:** The laptop screen is physically driven by the same GPU selected for passthrough.
+
+**Status in app:** Blocked unless explicit single-GPU acknowledgement is enabled and SSH/fallback recovery is confirmed. The app detects likely laptops from DMI/battery data, maps the target PCI GPU to its DRM/KMS card, and checks active internal panel connectors such as eDP/LVDS/DSI.
+
+**User fix:** Prefer firmware/vendor hybrid mode so Linux stays on the iGPU. If single-GPU laptop mode is intentional, enable SSH, keep thermal guard enabled, keep VM-stop auto recovery enabled, and expect the Linux GUI to disappear while the VM owns the GPU.
+
+## 17) Laptop has two GPUs but the dGPU still owns an active display
+
+**Symptom:** The app detects multiple GPUs, but the target GPU owns an active HDMI/DP/eDP/LVDS/DSI connector.
+
+**Status in app:** Blocked without confirmed recovery. Version 2.5.0 no longer assumes “two GPUs” means “safe fallback display” on laptops.
+
+**User fix:** Switch to hybrid/iGPU display mode or confirm that another display/SSH recovery path remains available before passthrough.
+
+## 18) Laptop display ownership cannot be verified
+
+**Symptom:** The target GPU cannot be mapped to a DRM/KMS card in host mode.
+
+**Status in app:** Blocked for laptop preflight/auto setup because the app cannot prove that the GPU is not driving the internal panel.
+
+**User fix:** Run the check while the GPU is bound to its normal Linux driver, not already hidden behind VFIO. If the topology still cannot be verified, configure manually only with SSH/reboot recovery.

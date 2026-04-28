@@ -13,9 +13,7 @@ SUBOP="${3:-}"
 #   3. keep the GPU assigned to VFIO/VM until changed manually.
 case "${OP}:${SUBOP}" in
   stopped:end|release:end)
-    if [[ -x /usr/local/bin/gsc ]]; then
-      /usr/local/bin/gsc on-vm-stopped "${DOMAIN}" || true
-    elif [[ -x /usr/local/bin/gpu-switcher-ctl ]]; then
+    if [[ -x /usr/local/bin/gpu-switcher-ctl ]]; then
       /usr/local/bin/gpu-switcher-ctl on-vm-stopped "${DOMAIN}" || true
     fi
     ;;
